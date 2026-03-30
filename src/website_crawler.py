@@ -12,8 +12,16 @@ LEADERSHIP_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
-ABOUT_LINK_KEYWORDS = re.compile(
-    r"\b(about|team|leadership|management|people|who we are|v\u1ec1 ch\u00fang t\u00f4i|\u0111\u1ed9i ng\u0169)\b",
+# High priority: actual "about us" pages
+ABOUT_HIGH_PRIORITY = re.compile(
+    r"\b(about-us|about us|ve-chung-toi|gioi-thieu|our story|who we are)\b"
+    r"|v\u1ec1\s+(ch\u00fang\s*t\u00f4i|c\u00f4ng\s*ty)|gi\u1edbi\s*thi\u1ec7u",
+    re.IGNORECASE
+)
+
+# Low priority: team/leadership section pages
+ABOUT_LOW_PRIORITY = re.compile(
+    r"\b(about|team|leadership|management|people|\u0111\u1ed9i\s*ng\u0169|ban\s*l\u00e3nh\s*\u0111\u1ea1o)\b",
     re.IGNORECASE
 )
 
@@ -35,23 +43,37 @@ class WebsiteCrawler:
             if leaders:
                 return leaders
 
-            about_url = self._find_about_link(homepage_html, website)
-            if about_url:
-                about_html = self._fetch_page(about_url)
-                leaders = self._extract_leaders_from_html(about_html)
+            for about_url in self._find_about_links(homepage_html, website):
+                try:
+                    about_html = self._fetch_page(about_url)
+                    leaders = self._extract_leaders_from_html(about_html)
+                    if leaders:
+                        return leaders
+                except Exception:
+                    continue
 
             return leaders
         except Exception:
             return []
 
-    def _find_about_link(self, html: str, base_url: str) -> str | None:
+    def _find_about_links(self, html: str, base_url: str) -> list[str]:
+        """Return about-like URLs: high-priority first, then low-priority."""
         soup = BeautifulSoup(html, "lxml")
+        high, low = [], []
+        seen = set()
         for tag in soup.find_all("a", href=True):
             text = tag.get_text(strip=True)
             href = tag["href"]
-            if ABOUT_LINK_KEYWORDS.search(text) or ABOUT_LINK_KEYWORDS.search(href):
-                return urljoin(base_url, href)
-        return None
+            combined = text + " " + href
+            full_url = urljoin(base_url, href)
+            if full_url in seen:
+                continue
+            seen.add(full_url)
+            if ABOUT_HIGH_PRIORITY.search(combined):
+                high.append(full_url)
+            elif ABOUT_LOW_PRIORITY.search(combined):
+                low.append(full_url)
+        return high + low
 
     def _extract_leaders_from_html(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
@@ -71,20 +93,32 @@ class WebsiteCrawler:
         return leaders
 
     def _find_nearby_name(self, element) -> str | None:
-        # Check previous sibling heading
+        # Strategy 1: previous sibling heading
         prev = element.find_previous_sibling(["h1", "h2", "h3", "h4"])
         if prev:
             candidate = prev.get_text(strip=True)
             if self._looks_like_name(candidate):
                 return candidate
-        # Check parent's previous sibling
+
+        # Strategy 2: name embedded in parent text before this element's text
+        # e.g. parent div = "MS. HA DOANTổng Giám Đốc..." and element = "Tổng Giám Đốc..."
         parent = element.parent
+        if parent:
+            parent_text = parent.get_text(strip=True)
+            element_text = element.get_text(strip=True)
+            if element_text and element_text in parent_text:
+                before = parent_text[: parent_text.index(element_text)].strip()
+                if self._looks_like_name(before):
+                    return before
+
+        # Strategy 3: parent's previous sibling
         if parent:
             prev_p = parent.find_previous_sibling()
             if prev_p:
                 candidate = prev_p.get_text(strip=True)
                 if self._looks_like_name(candidate):
                     return candidate
+
         return None
 
     def _looks_like_name(self, text: str) -> bool:

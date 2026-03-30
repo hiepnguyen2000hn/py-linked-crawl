@@ -24,7 +24,7 @@ MOCK_LOCAL_RESULTS = [
 
 def test_search_returns_normalized_companies():
     mock_result = MagicMock()
-    mock_result.as_dict.return_value = {"local_results": MOCK_LOCAL_RESULTS}
+    mock_result.get_dict.return_value = {"local_results": MOCK_LOCAL_RESULTS}
 
     with patch("src.serp_client.GoogleSearch") as MockGoogleSearch:
         MockGoogleSearch.return_value = mock_result
@@ -42,7 +42,7 @@ def test_search_returns_normalized_companies():
 
 def test_search_handles_no_local_results():
     mock_result = MagicMock()
-    mock_result.as_dict.return_value = {}
+    mock_result.get_dict.return_value = {}
 
     with patch("src.serp_client.GoogleSearch") as MockGoogleSearch:
         MockGoogleSearch.return_value = mock_result
@@ -54,7 +54,7 @@ def test_search_handles_no_local_results():
 
 def test_search_handles_none_fields():
     mock_result = MagicMock()
-    mock_result.as_dict.return_value = {
+    mock_result.get_dict.return_value = {
         "local_results": [
             {"title": "Company X"}
         ]

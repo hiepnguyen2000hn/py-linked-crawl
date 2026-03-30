@@ -15,7 +15,7 @@ class SerpClient:
             "api_key": self.api_key,
         }
         result = GoogleSearch(params)
-        data = result.as_dict()
+        data = result.get_dict()
         local_results = data.get("local_results", [])
         return [self._normalize(r) for r in local_results]
 

@@ -5,6 +5,7 @@ import sys
 import time
 from dotenv import load_dotenv
 from src.places_client import PlacesClient
+from src.serp_client import SerpClient
 from src.website_crawler import WebsiteCrawler
 from src.output_writer import save_results
 
@@ -13,25 +14,39 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Crawl company info by location and industry using Google Places API"
+        description="Crawl company info by location and industry"
     )
     parser.add_argument("--location", required=True, help='e.g. "Ho Chi Minh" or "Vietnam"')
     parser.add_argument("--industry", required=True, help='e.g. "ecommerce" or "mining"')
+    parser.add_argument("--source", choices=["google", "serpapi"], default="google",
+                        help="Data source: google (Places API) or serpapi (default: google)")
     parser.add_argument("--output-dir", default=".", help="Directory to save JSON output")
-    parser.add_argument("--no-crawl", action="store_true", help="Skip website crawling, only fetch Places data")
+    parser.add_argument("--no-crawl", action="store_true",
+                        help="Skip website crawling, only fetch company list")
     return parser.parse_args()
+
+
+def build_client(source: str):
+    if source == "serpapi":
+        api_key = os.getenv("SERPAPI_KEY")
+        if not api_key:
+            print("ERROR: SERPAPI_KEY not set. Add it to your .env file.")
+            sys.exit(1)
+        return SerpClient(api_key=api_key)
+
+    api_key = os.getenv("GOOGLE_PLACES_API_KEY")
+    if not api_key:
+        print("ERROR: GOOGLE_PLACES_API_KEY not set. Add it to your .env file.")
+        sys.exit(1)
+    return PlacesClient(api_key=api_key)
 
 
 def main():
     args = parse_args()
 
-    api_key = os.getenv("GOOGLE_PLACES_API_KEY")
-    if not api_key:
-        print("ERROR: GOOGLE_PLACES_API_KEY not set. Copy .env.example to .env and add your key.")
-        sys.exit(1)
+    client = build_client(args.source)
 
-    print(f"Searching for '{args.industry}' companies in '{args.location}'...")
-    client = PlacesClient(api_key=api_key)
+    print(f"[{args.source}] Searching for '{args.industry}' companies in '{args.location}'...")
     companies = client.search(location=args.location, industry=args.industry)
     print(f"Found {len(companies)} companies.")
 
@@ -41,7 +56,7 @@ def main():
             website = company.get("website")
             print(f"[{i}/{len(companies)}] Crawling {company['name']} ({website or 'no website'})...")
             company["leaders"] = crawler.crawl(website)
-            time.sleep(0.5)  # polite delay
+            time.sleep(0.5)
     else:
         for company in companies:
             company["leaders"] = []

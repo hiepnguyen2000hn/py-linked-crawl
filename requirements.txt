@@ -4,3 +4,10 @@ tenacity==8.2.3
 python-dotenv==1.0.1
 lxml==5.1.0
 google-search-results==2.4.2
+playwright>=1.44.0
+crawl4ai>=0.4.0
+transformers>=4.40.0
+torch>=2.2.0
+accelerate>=0.27.0
+peft>=0.10.0
+openai>=1.0.0

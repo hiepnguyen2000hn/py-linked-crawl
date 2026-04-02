@@ -4,9 +4,10 @@ analyze_companies.py — Đọc file companies markdown và phân tích với De
 
 Usage:
     python analyze_companies.py companies_ho_chi_minh_ecommerce_20260401_111846.md
-    python analyze_companies.py companies_ho_chi_minh_ecommerce_20260401_111846.md --output results.json
 """
 import argparse
+import csv
+import datetime
 import json
 import os
 import re
@@ -15,6 +16,10 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
+
+MODEL = "deepseek-chat"
+BASE_URL = "https://api.deepseek.com"
+OUTPUT_DIR = "response_deepseek"
 
 _ANALYSIS_SYSTEM = (
     "You are a business intelligence analyst. Extract structured data from company website content. "
@@ -58,9 +63,27 @@ Rules:
 Website content:
 {content}"""
 
+_EMPTY_RESULT = {
+    "leadership": [],
+    "contact": {
+        "emails": [], "phones": [], "linkedin_company": "",
+        "facebook": "", "twitter": "", "youtube": "", "other_socials": [],
+    },
+    "services": [],
+    "summary": "",
+}
+
+# ─── CSV columns ──────────────────────────────────────────────────────────────
+CSV_FIELDNAMES = [
+    "company_name", "website", "address", "phone", "rating", "description",
+    "person_name", "person_title", "person_linkedin", "person_email", "person_note",
+    "company_emails", "company_phones",
+    "linkedin_company", "facebook", "twitter", "youtube", "other_socials",
+    "services", "summary",
+]
+
 
 def parse_companies_markdown(filepath: str) -> list[dict]:
-    """Parse a companies markdown file into list of company dicts."""
     with open(filepath, encoding="utf-8") as f:
         text = f.read()
 
@@ -74,13 +97,8 @@ def parse_companies_markdown(filepath: str) -> list[dict]:
 
         name = lines[0][3:].strip()
         company = {
-            "name": name,
-            "website": "",
-            "address": "",
-            "phone": "",
-            "rating": "",
-            "description": "",
-            "content": "",
+            "name": name, "website": "", "address": "",
+            "phone": "", "rating": "", "description": "", "content": "",
         }
 
         for line in lines[1:]:
@@ -105,27 +123,17 @@ def parse_companies_markdown(filepath: str) -> list[dict]:
     return companies
 
 
-_EMPTY_RESULT = {
-    "leadership": [],
-    "contact": {"emails": [], "phones": [], "linkedin_company": "", "facebook": "",
-                "twitter": "", "youtube": "", "other_socials": []},
-    "services": [],
-    "summary": "",
-}
-
-
 def analyze_company(client: OpenAI, company: dict) -> dict:
-    """Run DeepSeek analysis on a company's content."""
     content = company.get("content", "")
     if not content:
         return {**_EMPTY_RESULT, "summary": "Không có nội dung website."}
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=MODEL,
             messages=[
                 {"role": "system", "content": _ANALYSIS_SYSTEM},
-                {"role": "user", "content": _ANALYSIS_TEMPLATE.format(content=content[:6000])},
+                {"role": "user", "content": _ANALYSIS_TEMPLATE.format(content=content)},
             ],
             temperature=0,
             max_tokens=2048,
@@ -145,10 +153,93 @@ def analyze_company(client: OpenAI, company: dict) -> dict:
     return _EMPTY_RESULT
 
 
+def to_csv_rows(company: dict, analysis: dict) -> list[dict]:
+    """Flatten one company + analysis into CSV rows (one row per leader, min 1 row)."""
+    base = {
+        "company_name":    company["name"],
+        "website":         company["website"],
+        "address":         company["address"],
+        "phone":           company["phone"],
+        "rating":          company["rating"],
+        "description":     company["description"],
+        "company_emails":  " | ".join(analysis["contact"].get("emails", [])),
+        "company_phones":  " | ".join(analysis["contact"].get("phones", [])),
+        "linkedin_company": analysis["contact"].get("linkedin_company", ""),
+        "facebook":        analysis["contact"].get("facebook", ""),
+        "twitter":         analysis["contact"].get("twitter", ""),
+        "youtube":         analysis["contact"].get("youtube", ""),
+        "other_socials":   " | ".join(analysis["contact"].get("other_socials", [])),
+        "services":        " | ".join(analysis.get("services", [])),
+        "summary":         analysis.get("summary", ""),
+    }
+
+    leadership = analysis.get("leadership", [])
+    if not leadership:
+        return [{**base, "person_name": "", "person_title": "",
+                 "person_linkedin": "", "person_email": "", "person_note": ""}]
+
+    rows = []
+    for person in leadership:
+        rows.append({
+            **base,
+            "person_name":    person.get("name", ""),
+            "person_title":   person.get("title", ""),
+            "person_linkedin": person.get("linkedin", ""),
+            "person_email":   person.get("email", ""),
+            "person_note":    person.get("note", ""),
+        })
+    return rows
+
+
+def print_company_result(i: int, total: int, company: dict, analysis: dict):
+    SEP = "─" * 60
+    name = company["name"]
+    website = company["website"]
+    summary = analysis.get("summary", "")
+    leadership = analysis.get("leadership", [])
+    contact = analysis.get("contact", {})
+    services = analysis.get("services", [])
+
+    print(f"\n{SEP}")
+    print(f"  [{i}/{total}]  {name}")
+    print(f"  Web     : {website}")
+    print(f"  Summary : {summary}")
+
+    if leadership:
+        print(f"  {'─'*10} Leadership / BOD {'─'*10}")
+        for p in leadership:
+            li = f"\n             LinkedIn : {p['linkedin']}" if p.get("linkedin") else ""
+            em = f"\n             Email    : {p['email']}" if p.get("email") else ""
+            nt = f"\n             Note     : {p['note']}" if p.get("note") else ""
+            print(f"  • {p['name']}  |  {p['title']}{li}{em}{nt}")
+
+    if contact.get("emails") or contact.get("phones"):
+        print(f"  {'─'*10} Contact {'─'*10}")
+        if contact.get("emails"):
+            print(f"  Email   : {' | '.join(contact['emails'])}")
+        if contact.get("phones"):
+            print(f"  Phone   : {' | '.join(contact['phones'])}")
+
+    socials = {k: v for k, v in contact.items()
+               if k not in ("emails", "phones", "other_socials") and v}
+    if socials or contact.get("other_socials"):
+        print(f"  {'─'*10} Social {'─'*10}")
+        for k, v in socials.items():
+            print(f"  {k:<18}: {v}")
+        for url in contact.get("other_socials", []):
+            print(f"  other             : {url}")
+
+    if services:
+        print(f"  {'─'*10} Services {'─'*10}")
+        for s in services:
+            print(f"  • {s}")
+
+    print(SEP)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze companies markdown with DeepSeek")
     parser.add_argument("file", help="Path to companies markdown file")
-    parser.add_argument("--output", help="Save results to JSON file (optional)")
     args = parser.parse_args()
 
     if not os.path.exists(args.file):
@@ -160,55 +251,63 @@ def main():
         print("ERROR: DEEPSEEK_API_KEY not set. Add it to your .env file.")
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path    = os.path.join(OUTPUT_DIR, f"deepseek_{timestamp}.csv")
+    result_path = os.path.join(OUTPUT_DIR, f"deepseek_{timestamp}_result.json")
 
-    print(f"Parsing {args.file}...")
+    client = OpenAI(api_key=api_key, base_url=BASE_URL)
+
+    print(f"╔{'═'*58}╗")
+    print(f"║  Model   : {MODEL:<46}║")
+    print(f"║  API     : {BASE_URL:<46}║")
+    print(f"║  Input   : {os.path.basename(args.file):<46}║")
+    print(f"║  CSV     : {csv_path:<46}║")
+    print(f"║  Result  : {result_path:<46}║")
+    print(f"╚{'═'*58}╝")
+
+    print(f"\nParsing {args.file}...")
     companies = parse_companies_markdown(args.file)
-    print(f"Found {len(companies)} companies. Analyzing with DeepSeek...\n")
+    print(f"Found {len(companies)} companies. Analyzing with DeepSeek ({MODEL})...\n")
 
-    results = []
-    for i, company in enumerate(companies, 1):
-        print(f"[{i}/{len(companies)}] Analyzing: {company['name']}...")
-        analysis = analyze_company(client, company)
-        result = {
-            "name": company["name"],
-            "website": company["website"],
-            "address": company["address"],
-            "phone": company["phone"],
-            "rating": company["rating"],
-            "description": company["description"],
-            "deepseek_analysis": analysis,
-        }
-        results.append(result)
+    all_results = []
+    all_csv_rows = []
 
-        summary = analysis.get("summary", "")
-        leadership = analysis.get("leadership", [])
-        contact = analysis.get("contact", {})
-        services = analysis.get("services", [])
-        print(f"  Summary   : {summary}")
-        if leadership:
-            for p in leadership:
-                li = f" | {p['linkedin']}" if p.get("linkedin") else ""
-                print(f"  Leader    : {p['name']} — {p['title']}{li}")
-        if contact.get("emails"):
-            print(f"  Emails    : {contact['emails']}")
-        if contact.get("phones"):
-            print(f"  Phones    : {contact['phones']}")
-        socials = [v for k, v in contact.items()
-                   if k not in ("emails", "phones", "other_socials") and v]
-        if socials:
-            print(f"  Socials   : {socials}")
-        if services:
-            print(f"  Services  : {services[:3]}")
-        print()
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"Results saved to: {args.output}")
-    else:
-        print("\n=== FULL RESULTS ===")
-        print(json.dumps(results, ensure_ascii=False, indent=2))
+        for i, company in enumerate(companies, 1):
+            print(f"[{i}/{len(companies)}] {company['name']}...")
+            analysis = analyze_company(client, company)
+
+            result = {
+                "company_name": company["name"],
+                "website":      company["website"],
+                "address":      company["address"],
+                "phone":        company["phone"],
+                "rating":       company["rating"],
+                "description":  company["description"],
+                "analysis":     analysis,
+            }
+            all_results.append(result)
+
+            rows = to_csv_rows(company, analysis)
+            for row in rows:
+                writer.writerow(row)
+            all_csv_rows.extend(rows)
+
+            print_company_result(i, len(companies), company, analysis)
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{'═'*60}")
+    print(f"  Done! {len(companies)} companies analyzed.")
+    print(f"  Model   : {MODEL}")
+    print(f"  CSV     : {csv_path}  ({len(all_csv_rows)} rows)")
+    print(f"  Result  : {result_path}")
+    print(f"{'═'*60}")
 
 
 if __name__ == "__main__":

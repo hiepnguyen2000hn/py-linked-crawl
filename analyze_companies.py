@@ -17,23 +17,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _ANALYSIS_SYSTEM = (
-    "You are a business analyst. Given crawled website content of a company, "
-    "extract structured information and return ONLY valid JSON."
+    "You are a business intelligence analyst. Extract structured data from company website content. "
+    "Return ONLY valid JSON, no explanation, no markdown code blocks."
 )
 
 _ANALYSIS_TEMPLATE = """\
-Analyze this company's website content and extract:
-1. Leadership personnel (CEO, CTO, Founder, Director, etc.)
-2. Main services/products (max 5)
-3. One-sentence company summary in Vietnamese
+Extract ALL of the following from the company website content below.
 
-Return ONLY a JSON object like:
+Return ONLY a JSON object with these exact keys:
 {{
-  "leaders": [{{"name": "...", "title": "..."}}],
-  "services": ["...", "..."],
-  "summary": "..."
+  "leadership": [
+    {{
+      "name": "full name",
+      "title": "job title (CEO/CTO/CFO/COO/Founder/Director/BOD member/etc.)",
+      "linkedin": "linkedin profile URL or empty string",
+      "email": "personal email or empty string",
+      "note": "any extra info (years experience, background) or empty string"
+    }}
+  ],
+  "contact": {{
+    "emails": ["list of company emails found"],
+    "phones": ["list of phone numbers found"],
+    "linkedin_company": "company LinkedIn page URL or empty string",
+    "facebook": "Facebook page URL or empty string",
+    "twitter": "Twitter/X URL or empty string",
+    "youtube": "YouTube URL or empty string",
+    "other_socials": ["any other social/contact URLs"]
+  }},
+  "services": ["main service or product 1", "..."],
+  "summary": "one sentence describing the company in Vietnamese"
 }}
-If a field has no data, use empty list [] or empty string "".
+
+Rules:
+- Include ALL people with executive/leadership titles: CEO, CTO, CFO, COO, CPO, CMO, Founder, Co-founder, Director, Managing Director, President, Vice President, Head of, BOD member, Chairman, Giám đốc, Phó giám đốc, Tổng giám đốc, Chủ tịch, Thành viên HĐQT
+- Extract emails like name@company.com or contact@company.com
+- Extract all social media URLs (linkedin.com, facebook.com, twitter.com, x.com, youtube.com, instagram.com, etc.)
+- If a field has no data use empty string "" or empty list []
+- Do NOT invent data — only extract what is explicitly present in the text
 
 Website content:
 {content}"""
@@ -85,34 +105,44 @@ def parse_companies_markdown(filepath: str) -> list[dict]:
     return companies
 
 
+_EMPTY_RESULT = {
+    "leadership": [],
+    "contact": {"emails": [], "phones": [], "linkedin_company": "", "facebook": "",
+                "twitter": "", "youtube": "", "other_socials": []},
+    "services": [],
+    "summary": "",
+}
+
+
 def analyze_company(client: OpenAI, company: dict) -> dict:
     """Run DeepSeek analysis on a company's content."""
     content = company.get("content", "")
     if not content:
-        return {"leaders": [], "services": [], "summary": "Không có nội dung website."}
+        return {**_EMPTY_RESULT, "summary": "Không có nội dung website."}
 
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": _ANALYSIS_SYSTEM},
-                {"role": "user", "content": _ANALYSIS_TEMPLATE.format(content=content[:5000])},
+                {"role": "user", "content": _ANALYSIS_TEMPLATE.format(content=content[:6000])},
             ],
             temperature=0,
-            max_tokens=1024,
+            max_tokens=2048,
         )
         generated = response.choices[0].message.content or ""
         match = re.search(r"\{.*\}", generated, re.DOTALL)
         if match:
             data = json.loads(match.group())
             return {
-                "leaders": data.get("leaders", []),
+                "leadership": data.get("leadership", []),
+                "contact": data.get("contact", _EMPTY_RESULT["contact"]),
                 "services": data.get("services", []),
                 "summary": data.get("summary", ""),
             }
     except Exception as e:
         print(f"    [ERROR] DeepSeek call failed: {e}")
-    return {"leaders": [], "services": [], "summary": ""}
+    return _EMPTY_RESULT
 
 
 def main():
@@ -152,13 +182,24 @@ def main():
         results.append(result)
 
         summary = analysis.get("summary", "")
-        leaders = analysis.get("leaders", [])
+        leadership = analysis.get("leadership", [])
+        contact = analysis.get("contact", {})
         services = analysis.get("services", [])
-        print(f"  Summary  : {summary}")
-        if leaders:
-            print(f"  Leaders  : {[l['name'] + ' (' + l['title'] + ')' for l in leaders]}")
+        print(f"  Summary   : {summary}")
+        if leadership:
+            for p in leadership:
+                li = f" | {p['linkedin']}" if p.get("linkedin") else ""
+                print(f"  Leader    : {p['name']} — {p['title']}{li}")
+        if contact.get("emails"):
+            print(f"  Emails    : {contact['emails']}")
+        if contact.get("phones"):
+            print(f"  Phones    : {contact['phones']}")
+        socials = [v for k, v in contact.items()
+                   if k not in ("emails", "phones", "other_socials") and v]
+        if socials:
+            print(f"  Socials   : {socials}")
         if services:
-            print(f"  Services : {services}")
+            print(f"  Services  : {services[:3]}")
         print()
 
     if args.output:

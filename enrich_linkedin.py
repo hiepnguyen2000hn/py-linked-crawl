@@ -6,6 +6,8 @@ Usage:
   python enrich_linkedin.py                         # process all files
   python enrich_linkedin.py --file <path>           # single file
   python enrich_linkedin.py --dry-run               # preview without API calls
+  python enrich_linkedin.py --sheets                # enrich then push to Google Sheets
+  python enrich_linkedin.py --sheets --sheet-name Tab1  # push to specific tab
 """
 import argparse
 import json
@@ -68,6 +70,10 @@ def main():
     parser.add_argument("--file", help="Process a single JSON file instead of all files")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview leaders that would be searched — no API calls")
+    parser.add_argument("--sheets", action="store_true",
+                        help="After enriching, push all companies to Google Sheets")
+    parser.add_argument("--sheet-name", default="Sheet1",
+                        help="Tab name in Google Sheet (default: Sheet1)")
     args = parser.parse_args()
 
     key = os.getenv("SERPAPI_KEY")
@@ -107,13 +113,26 @@ def main():
 
     enricher = LinkedInEnricher(key)
     total_found = 0
+    all_companies = []
+
     for fp in files:
         print(f"\n=== {os.path.basename(fp)} ===")
         n = enrich_file(fp, enricher)
         print(f"  => {n} leader(s) now have LinkedIn")
         total_found += n
 
+        if args.sheets:
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
+            all_companies.extend(data.get("companies", []))
+
     print(f"\nDone. Total leaders with LinkedIn across all files: {total_found}")
+
+    if args.sheets:
+        from src.sheets_writer import save_to_sheet
+        print(f"\nPushing {len(all_companies)} companies to Google Sheets (tab: {args.sheet_name})...")
+        url = save_to_sheet(all_companies, sheet_name=args.sheet_name)
+        print(f"Sheet URL: {url}")
 
 
 if __name__ == "__main__":

@@ -206,10 +206,6 @@ def run_markdown_mode(companies: list[dict], args, enricher=None):
         result = _crawl_company_pages(website, crawler, helper, extractor)
         company["socials"] = result.get("socials", {})
 
-        if extractor and not result["leaders"]:
-            print(f"    No leaders found — skipped")
-            continue
-
         if extractor and result["leaders"]:
             print(f"    Extracted {len(result['leaders'])} leader(s): {[l['name'] for l in result['leaders']]}")
         if enricher and result["leaders"]:

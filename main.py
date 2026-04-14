@@ -135,18 +135,20 @@ def _crawl_company_pages(
     try:
         html = fetch_html(website, timeout=10)
         about_links = helper._find_about_links(html, website)
+        blog_links = helper._find_blog_links(html, website)
     except Exception:
         about_links = []
+        blog_links = []
 
     seen = set()
     urls = []
-    for u in [website] + about_links:
+    for u in [website] + about_links + blog_links:
         if u not in seen:
             seen.add(u)
             urls.append(u)
 
     if len(urls) > 1:
-        print(f"    Discovered {len(urls)} pages: homepage + {len(about_links)} about/team links")
+        print(f"    Discovered {len(urls)} pages: homepage + {len(about_links)} about/team + {len(blog_links)} blog/news")
 
     # Extract socials from homepage HTML
     socials = helper._extract_socials_from_html(html) if html else {}

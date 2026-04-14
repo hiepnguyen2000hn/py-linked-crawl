@@ -1,9 +1,36 @@
 # src/sheets_writer.py
 import os
+import re
 import gspread
 from google.oauth2.service_account import Credentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+_URL_RE = re.compile(r'https?://[^\s\]\)>,\'"]+')
+
+_LINK_COLOR = {"red": 0.06, "green": 0.47, "blue": 0.93}  # Google blue
+
+
+def _build_text_format_runs(text: str) -> list:
+    """Tạo textFormatRuns cho Sheets API: URL trong text → blue underline hyperlink."""
+    runs = []
+    last_end = 0
+    for m in _URL_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if s > last_end:
+            runs.append({"startIndex": last_end, "format": {}})
+        runs.append({
+            "startIndex": s,
+            "format": {
+                "link": {"uri": m.group()},
+                "foregroundColorStyle": {"rgbColor": _LINK_COLOR},
+                "underline": True,
+            },
+        })
+        last_end = e
+    if last_end > 0 and last_end < len(text):
+        runs.append({"startIndex": last_end, "format": {}})
+    return runs
 
 SPREADSHEET_ID = "1PW5LnQyXjyl0h16ooufYNYjR1_eb8DgfnCEGLNjsf10"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -156,6 +183,270 @@ def read_from_sheet(
     else:
         sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
     return sheet.get_all_records()
+
+
+def update_sheet_with_extra_cols(
+    enriched_rows: list[dict],
+    spreadsheet_id: str = SPREADSHEET_ID,
+    sheet_name: str | None = None,
+    gid: int | None = None,
+) -> str:
+    """Ghi đè tab nguồn: giữ nguyên các cột cũ + thêm các cột enriched sang phải.
+    Dùng cùng gid/sheet_name đã đọc, KHÔNG tạo tab mới.
+    """
+    if not enriched_rows:
+        print("  [Sheets] No rows to write.")
+        return ""
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+
+    # Header: tất cả key gốc (trừ key enriched) + ENRICHED_EXTRA_HEADERS
+    original_keys = [
+        k for k in enriched_rows[0].keys()
+        if k not in ENRICHED_EXTRA_KEYS
+    ]
+    all_headers = original_keys + ENRICHED_EXTRA_HEADERS
+
+    def make_row(row: dict) -> list:
+        return (
+            [str(row.get(k, "") or "") for k in original_keys]
+            + [str(row.get(k, "") or "") for k in ENRICHED_EXTRA_KEYS]
+        )
+
+    data = [all_headers] + [make_row(r) for r in enriched_rows]
+    sheet.clear()
+    sheet.update(data, "A1")
+
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet.id}"
+    print(f"  [Sheets] Updated {len(enriched_rows)} row(s) in '{sheet.title}' (same tab)")
+    print(f"  [Sheets] {url}")
+    return url
+
+
+def append_col_with_links(
+    enriched_rows: list[dict],
+    spreadsheet_id: str,
+    col_key: str,
+    col_header: str,
+    sheet_name: str | None = None,
+    gid: int | None = None,
+) -> str:
+    """Ghi thêm cột text vào tab; các URL trong nội dung sẽ thành hyperlink xanh.
+    Dùng Sheets API updateCells với textFormatRuns.
+    """
+    if not enriched_rows:
+        print("  [Sheets] No rows to write.")
+        return ""
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+
+    headers = sheet.row_values(1)
+    if col_header in headers:
+        col_idx = headers.index(col_header) + 1
+    else:
+        col_idx = len([h for h in headers if h]) + 1
+
+    # Ghi header bằng update_cell thông thường
+    sheet.update_cell(1, col_idx, col_header)
+
+    # Build updateCells request cho từng data row
+    row_data = []
+    for row in enriched_rows:
+        text = str(row.get(col_key, "") or "")
+        runs = _build_text_format_runs(text)
+        cell = {
+            "userEnteredValue": {"stringValue": text},
+        }
+        if runs:
+            cell["textFormatRuns"] = runs
+        row_data.append({"values": [cell]})
+
+    requests = [{
+        "updateCells": {
+            "rows": row_data,
+            "fields": "userEnteredValue,textFormatRuns",
+            "range": {
+                "sheetId": sheet.id,
+                "startRowIndex": 1,
+                "endRowIndex": len(enriched_rows) + 1,
+                "startColumnIndex": col_idx - 1,
+                "endColumnIndex": col_idx,
+            },
+        }
+    }]
+    spreadsheet.batch_update({"requests": requests})
+
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet.id}"
+    print(f"  [Sheets] Appended col '{col_header}' with links ({len(enriched_rows)} rows) in '{sheet.title}'")
+    print(f"  [Sheets] {url}")
+    return url
+
+
+def append_checkbox_col_to_sheet(
+    enriched_rows: list[dict],
+    spreadsheet_id: str,
+    col_key: str,
+    col_header: str,
+    sheet_name: str | None = None,
+    gid: int | None = None,
+) -> None:
+    """Ghi thêm 1 cột checkbox (TRUE/FALSE) vào tab hiện tại.
+    Áp dụng BOOLEAN data validation (checkbox) cho toàn cột dữ liệu.
+    Mặc định FALSE cho ô chưa có giá trị.
+    """
+    if not enriched_rows:
+        return
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+
+    headers = sheet.row_values(1)
+    if col_header in headers:
+        col_idx = headers.index(col_header) + 1
+    else:
+        col_idx = len([h for h in headers if h]) + 1
+
+    # Mở rộng sheet nếu cột vượt quá giới hạn hiện tại
+    if col_idx > sheet.col_count:
+        sheet.resize(cols=col_idx + 10)
+
+    # Ghi header + giá trị TRUE/FALSE
+    cells = [gspread.Cell(1, col_idx, col_header)]
+    for i, row in enumerate(enriched_rows):
+        val = row.get(col_key, False)
+        # Chuẩn hoá về boolean Python để gspread ghi đúng kiểu
+        cells.append(gspread.Cell(i + 2, col_idx, bool(val)))
+
+    sheet.update_cells(cells, value_input_option="RAW")
+
+    # Áp dụng checkbox format (BOOLEAN data validation)
+    requests = [{
+        "setDataValidation": {
+            "range": {
+                "sheetId": sheet.id,
+                "startRowIndex": 1,
+                "endRowIndex": len(enriched_rows) + 1,
+                "startColumnIndex": col_idx - 1,
+                "endColumnIndex": col_idx,
+            },
+            "rule": {
+                "condition": {"type": "BOOLEAN"},
+                "showCustomUi": True,
+            },
+        }
+    }]
+    spreadsheet.batch_update({"requests": requests})
+    print(f"  [Sheets] Appended checkbox col '{col_header}' ({len(enriched_rows)} rows) in '{sheet.title}'")
+
+
+def update_sheet_with_cols(
+    enriched_rows: list[dict],
+    spreadsheet_id: str,
+    extra_keys: list[str],
+    extra_headers: list[str],
+    sheet_name: str | None = None,
+    gid: int | None = None,
+) -> str:
+    """Generic version of update_sheet_with_extra_cols.
+    Ghi đè tab nguồn: giữ nguyên các cột cũ + thêm extra_headers sang phải.
+    extra_keys: dict keys chứa giá trị enriched (e.g. ["post_1", "post_2", "post_3"])
+    extra_headers: tên cột hiển thị trong sheet (e.g. ["Bài Viết 1", "Bài Viết 2", "Bài Viết 3"])
+    """
+    if not enriched_rows:
+        print("  [Sheets] No rows to write.")
+        return ""
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+
+    original_keys = [
+        k for k in enriched_rows[0].keys()
+        if k not in extra_keys
+    ]
+    all_headers = original_keys + extra_headers
+
+    def make_row(row: dict) -> list:
+        return (
+            [str(row.get(k, "") or "") for k in original_keys]
+            + [str(row.get(k, "") or "") for k in extra_keys]
+        )
+
+    data = [all_headers] + [make_row(r) for r in enriched_rows]
+    sheet.clear()
+    sheet.update(data, "A1")
+
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet.id}"
+    print(f"  [Sheets] Updated {len(enriched_rows)} row(s) in '{sheet.title}' (same tab)")
+    print(f"  [Sheets] {url}")
+    return url
+
+
+def append_col_to_sheet(
+    enriched_rows: list[dict],
+    spreadsheet_id: str,
+    col_key: str,
+    col_header: str,
+    sheet_name: str | None = None,
+    gid: int | None = None,
+) -> str:
+    """Ghi thêm 1 cột mới vào tab hiện tại mà không xóa/ghi lại toàn bộ sheet.
+    Tìm cột theo col_header trong hàng tiêu đề; nếu chưa có thì thêm vào cuối.
+    enriched_rows phải theo đúng thứ tự hàng trong sheet (hàng 2 trở đi).
+    """
+    if not enriched_rows:
+        print("  [Sheets] No rows to write.")
+        return ""
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+
+    headers = sheet.row_values(1)
+    if col_header in headers:
+        col_idx = headers.index(col_header) + 1  # 1-based
+    else:
+        col_idx = len([h for h in headers if h]) + 1
+
+    # Mở rộng sheet nếu cột vượt quá giới hạn hiện tại
+    if col_idx > sheet.col_count:
+        sheet.resize(cols=col_idx + 10)
+
+    cells = [gspread.Cell(1, col_idx, col_header)]
+    for i, row in enumerate(enriched_rows):
+        cells.append(gspread.Cell(i + 2, col_idx, str(row.get(col_key, "") or "")))
+
+    sheet.update_cells(cells, value_input_option="RAW")
+
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={sheet.id}"
+    print(f"  [Sheets] Appended col '{col_header}' ({len(enriched_rows)} rows) in '{sheet.title}'")
+    print(f"  [Sheets] {url}")
+    return url
 
 
 def write_enriched_sheet(

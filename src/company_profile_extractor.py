@@ -15,9 +15,10 @@ _USER_TEMPLATE = """\
 Đọc nội dung website công ty bên dưới và trích xuất các thông tin sau.
 Trả về ONLY một JSON object với đúng 5 key sau:
 
-- "tuyen_dung": Thông tin tuyển dụng hiện tại — vị trí đang tuyển, link trang careers nếu có. \
-Nếu không có: "".
-- "blog": Link trang blog hoặc news của công ty, hoặc tiêu đề + link bài viết gần nhất nếu tìm được. \
+- "tuyen_dung": Danh sách tên các vị trí đang tuyển dụng hiện tại, mỗi vị trí 1 dòng dùng ký hiệu •. \
+KHÔNG lấy URL hay link. Chỉ lấy tên công việc. Nếu không có: "".
+- "blog": Tóm tắt 3 bài viết/tin tức gần nhất tìm được trong nội dung, mỗi bài 1 dòng dùng ký hiệu •, \
+chỉ lấy text tóm tắt nội dung, không lấy URL. QUAN TRỌNG: giữ nguyên ngôn ngữ gốc của bài viết, KHÔNG dịch sang ngôn ngữ khác. \
 Nếu không có: "".
 - "linh_vuc": Lĩnh vực hoạt động chính của công ty (ngắn gọn, cách nhau bằng dấu phẩy). \
 Ví dụ: "Fintech, Payment, B2B SaaS".
@@ -27,8 +28,8 @@ Nếu không có: "".
 
 Chỉ trả về JSON, không giải thích thêm. Ví dụ:
 {{
-  "tuyen_dung": "Tuyển Senior Backend Engineer — https://company.com/careers",
-  "blog": "https://company.com/blog — Bài gần nhất: 'Ra mắt sản phẩm X'",
+  "tuyen_dung": "• Senior Backend Engineer\n• Product Manager\n• DevOps Engineer",
+  "blog": "• Ra mắt sản phẩm X hỗ trợ thanh toán QR\n• Công ty đạt chứng chỉ ISO 27001\n• Hợp tác chiến lược với VNPT",
   "linh_vuc": "E-commerce, Logistics Technology",
   "du_an_gan_nhat": "Hệ thống quản lý kho ABC triển khai Q1 2026",
   "doi_tac": "Vietcombank, VNPT, FPT"

@@ -1,63 +1,108 @@
 # src/website_crawler.py
 import re
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from tenacity import retry, stop_after_attempt, wait_exponential
+from src.browser_fetcher import fetch_html
 
 LEADERSHIP_KEYWORDS = re.compile(
     r"\b(ceo|coo|cto|cfo|founder|co-founder|president|director|chief executive|"
     r"chief operating|chief technology|chief financial|managing director|"
-    r"gi\u00e1m \u0111\u1ed1c|t\u1ed5ng gi\u00e1m \u0111\u1ed1c|ch\u1ee7 t\u1ecbch)\b",
+    r"giám đốc|tổng giám đốc|chủ tịch)\b",
     re.IGNORECASE
 )
 
-# High priority: actual "about us" pages
 ABOUT_HIGH_PRIORITY = re.compile(
     r"\b(about-us|about us|ve-chung-toi|gioi-thieu|our story|who we are)\b"
-    r"|v\u1ec1\s+(ch\u00fang\s*t\u00f4i|c\u00f4ng\s*ty)|gi\u1edbi\s*thi\u1ec7u",
+    r"|về\s+(chúng\s*tôi|công\s*ty)|giới\s*thiệu",
     re.IGNORECASE
 )
 
-# Low priority: team/leadership section pages
 ABOUT_LOW_PRIORITY = re.compile(
-    r"\b(about|team|leadership|management|people|\u0111\u1ed9i\s*ng\u0169|ban\s*l\u00e3nh\s*\u0111\u1ea1o)\b",
+    r"\b(about|team|leadership|management|people|đội\s*ngũ|ban\s*lãnh\s*đạo)\b",
     re.IGNORECASE
+)
+
+BLOG_PATTERNS = re.compile(
+    r"\b(blog|news|insights|resources|press|tin-tuc|tin\s*tức|bai-viet|bài\s*viết|"
+    r"updates|articles|media|newsroom|stories)\b",
+    re.IGNORECASE
+)
+
+SOCIAL_PATTERNS = {
+    "linkedin":  re.compile(r"linkedin\.com/(company|in)/", re.IGNORECASE),
+    "facebook":  re.compile(r"facebook\.com/(?!sharer|share|dialog)", re.IGNORECASE),
+    "instagram": re.compile(r"instagram\.com/", re.IGNORECASE),
+    "twitter":   re.compile(r"(twitter\.com|x\.com)/(?!intent|share)", re.IGNORECASE),
+    "youtube":   re.compile(r"youtube\.com/(channel|c|@|user)/", re.IGNORECASE),
+    "whatsapp":  re.compile(r"(wa\.me|whatsapp\.com/send|api\.whatsapp\.com)", re.IGNORECASE),
+    "wechat":    re.compile(r"(weixin\.qq\.com|wechat\.com)", re.IGNORECASE),
+    "telegram":  re.compile(r"t\.me/", re.IGNORECASE),
+    "line":      re.compile(r"line\.me/", re.IGNORECASE),
+    "tiktok":    re.compile(r"tiktok\.com/@", re.IGNORECASE),
+    "zalo":      re.compile(r"zalo\.me/", re.IGNORECASE),
+}
+
+PHONE_PATTERN = re.compile(
+    r"(?:tel:|href=[\"']tel:)?\+?[\d][\d\s\-\(\)\.]{7,18}[\d]",
+    re.IGNORECASE,
 )
 
 
 class WebsiteCrawler:
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; CompanyCrawler/1.0)"
-        })
 
-    def crawl(self, website: str) -> list[dict]:
+    def crawl(self, website: str) -> dict:
         if not website:
-            return []
+            return {"leaders": [], "socials": {}}
         try:
             homepage_html = self._fetch_page(website)
+            socials = self._extract_socials_from_html(homepage_html)
             leaders = self._extract_leaders_from_html(homepage_html)
-            if leaders:
-                return leaders
 
-            for about_url in self._find_about_links(homepage_html, website):
-                try:
-                    about_html = self._fetch_page(about_url)
-                    leaders = self._extract_leaders_from_html(about_html)
-                    if leaders:
-                        return leaders
-                except Exception:
-                    continue
+            if not leaders:
+                for about_url in self._find_about_links(homepage_html, website):
+                    try:
+                        about_html = self._fetch_page(about_url)
+                        leaders = self._extract_leaders_from_html(about_html)
+                        if leaders:
+                            break
+                    except Exception:
+                        continue
 
-            return leaders
+            return {"leaders": leaders, "socials": socials}
         except Exception:
-            return []
+            return {"leaders": [], "socials": {}}
+
+    def _extract_socials_from_html(self, html: str) -> dict:
+        soup = BeautifulSoup(html, "lxml")
+        result = {}
+        phones = []
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+
+            if href.startswith("mailto:") and "email" not in result:
+                result["email"] = href[len("mailto:"):]
+                continue
+
+            if href.startswith("tel:"):
+                phone = href[4:].strip()
+                if phone and phone not in phones:
+                    phones.append(phone)
+                continue
+
+            for platform, pattern in SOCIAL_PATTERNS.items():
+                if platform not in result and pattern.search(href):
+                    result[platform] = href
+                    break
+
+        if phones:
+            result["phones"] = phones
+
+        return result
 
     def _find_about_links(self, html: str, base_url: str) -> list[str]:
-        """Return about-like URLs: high-priority first, then low-priority."""
         soup = BeautifulSoup(html, "lxml")
         high, low = [], []
         seen = set()
@@ -74,6 +119,18 @@ class WebsiteCrawler:
             elif ABOUT_LOW_PRIORITY.search(combined):
                 low.append(full_url)
         return high + low
+
+    def _find_blog_links(self, html: str, base_url: str) -> list[str]:
+        """Tìm link trang blog/news từ homepage HTML."""
+        soup = BeautifulSoup(html, "lxml")
+        seen, results = set(), []
+        for tag in soup.find_all("a", href=True):
+            combined = tag.get_text(strip=True) + " " + tag["href"]
+            full_url = urljoin(base_url, tag["href"])
+            if full_url not in seen and BLOG_PATTERNS.search(combined):
+                seen.add(full_url)
+                results.append(full_url)
+        return results[:3]  # tối đa 3 trang blog/news
 
     def _extract_leaders_from_html(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
@@ -93,15 +150,12 @@ class WebsiteCrawler:
         return leaders
 
     def _find_nearby_name(self, element) -> str | None:
-        # Strategy 1: previous sibling heading
         prev = element.find_previous_sibling(["h1", "h2", "h3", "h4"])
         if prev:
             candidate = prev.get_text(strip=True)
             if self._looks_like_name(candidate):
                 return candidate
 
-        # Strategy 2: name embedded in parent text before this element's text
-        # e.g. parent div = "MS. HA DOANTổng Giám Đốc..." and element = "Tổng Giám Đốc..."
         parent = element.parent
         if parent:
             parent_text = parent.get_text(strip=True)
@@ -111,12 +165,19 @@ class WebsiteCrawler:
                 if self._looks_like_name(before):
                     return before
 
-        # Strategy 3: parent's previous sibling
+        # Strategy 3: iterate ALL previous siblings of parent (skip empty ones)
         if parent:
-            prev_p = parent.find_previous_sibling()
-            if prev_p:
+            for prev_p in parent.find_previous_siblings():
                 candidate = prev_p.get_text(strip=True)
-                if self._looks_like_name(candidate):
+                if candidate and self._looks_like_name(candidate):
+                    return candidate
+
+        # Strategy 4: same but one level up (grandparent's previous siblings)
+        grandparent = parent.parent if parent else None
+        if grandparent:
+            for prev_gp in grandparent.find_previous_siblings():
+                candidate = prev_gp.get_text(strip=True)
+                if candidate and self._looks_like_name(candidate):
                     return candidate
 
         return None
@@ -129,8 +190,5 @@ class WebsiteCrawler:
             return False
         return all(w[0].isupper() for w in words if w)
 
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
     def _fetch_page(self, url: str) -> str:
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        return response.text
+        return fetch_html(url, timeout=self.timeout)

@@ -528,7 +528,7 @@ def main():
 
     api_key = os.getenv("GOOGLE_PLACES_API_KEY")
     if not api_key:
-        print("ERROR: GOOGLE_PLACES_API_KEY not set. Copy .env.example to .env and add your key.")
+        print("ERROR: GOOGLE_PLACES_API_KEY not set. Copy .env to .env and add your key.")
         sys.exit(1)
 
     print(f"Searching for '{args.industry}' companies in '{args.location}'...")
@@ -563,8 +563,8 @@ if __name__ == "__main__":
 **Step 2: Test manually**
 
 ```bash
-# Copy .env.example to .env and set your API key first
-cp .env.example .env
+# Copy .env to .env and set your API key first
+cp .env .env
 
 # Run
 python main.py --location "Ho Chi Minh" --industry "ecommerce"

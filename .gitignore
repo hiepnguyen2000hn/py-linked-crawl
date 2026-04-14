@@ -1,5 +1,20 @@
+# Secrets & credentials
 .env
+credentials.json
+*.json
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
-*.json
+
+# Data output (large files)
+response_deepseek/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude memory
+CLAUDE.md

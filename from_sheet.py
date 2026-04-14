@@ -44,10 +44,6 @@ def parse_args() -> argparse.Namespace:
         help="Tên cột chứa tên công ty (default: company_name)"
     )
     parser.add_argument(
-        "--output-sheet", default="Enriched",
-        help="Tên tab output trong cùng spreadsheet (default: Enriched)"
-    )
-    parser.add_argument(
         "--delay", type=float, default=1.0,
         help="Số giây nghỉ giữa các công ty (default: 1.0)"
     )
@@ -106,7 +102,7 @@ def _crawl_and_extract(
 def main():
     args = parse_args()
 
-    from src.sheets_writer import read_from_sheet, write_enriched_sheet
+    from src.sheets_writer import read_from_sheet, update_sheet_with_extra_cols
 
     # 1. Đọc sheet
     tab_desc = f"gid={args.gid}" if args.gid else f"sheet='{args.sheet_name}'"
@@ -151,12 +147,14 @@ def main():
         if i < len(rows):
             time.sleep(args.delay)
 
-    # 4. Ghi kết quả
-    print(f"\nWriting {len(enriched)} enriched row(s) to tab '{args.output_sheet}' ...")
-    url = write_enriched_sheet(
+    # 4. Ghi kết quả ngược lại tab nguồn (thêm cột, không tạo tab mới)
+    tab_desc = f"gid={args.gid}" if args.gid else f"sheet='{args.sheet_name}'"
+    print(f"\nWriting {len(enriched)} enriched row(s) back to source tab [{tab_desc}] ...")
+    url = update_sheet_with_extra_cols(
         enriched_rows=enriched,
         spreadsheet_id=args.spreadsheet_id,
-        sheet_name=args.output_sheet,
+        sheet_name=args.sheet_name,
+        gid=args.gid,
     )
 
     print(f"\nDone! View results at:\n  {url}")

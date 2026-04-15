@@ -2,7 +2,14 @@
 import asyncio
 import json
 import os
+import sys
 from typing import Optional
+
+# Windows: force UTF-8 stdout/stderr to avoid charmap codec errors
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 
 class Crawl4AICrawler:
@@ -20,7 +27,8 @@ class Crawl4AICrawler:
         try:
             return asyncio.run(self._crawl(url, cookies=cookies))
         except Exception as e:
-            print(f"  [crawl4ai] Error crawling {url}: {e}")
+            msg = str(e).encode("utf-8", errors="replace").decode("utf-8")
+            print(f"  [crawl4ai] Error crawling {url}: {msg}")
             return ""
 
     async def _crawl(self, url: str, cookies: Optional[list] = None) -> str:
@@ -44,12 +52,12 @@ class Crawl4AICrawler:
                 content_filter=PruningContentFilter(),
                 options={"ignore_links": False, "ignore_images": False},
             ),
-            headers=extra_headers if extra_headers else None,
         )
 
         browser_config = BrowserConfig(
             headless=True,
             verbose=False,
+            headers=extra_headers if extra_headers else {},
         )
 
         async with AsyncWebCrawler(config=browser_config) as crawler:

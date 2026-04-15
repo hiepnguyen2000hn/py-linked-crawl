@@ -313,38 +313,99 @@ async def linkedin_extract(req: LinkedInExtractRequest):
 
 @app.post("/linkedin-write")
 async def linkedin_write(req: LinkedInWriteRequest):
-    """Ghi kết quả posts vào Google Sheet."""
-    from src.sheets_writer import read_from_sheet, append_col_with_links, append_checkbox_col_to_sheet
+    """Ghi kết quả posts vào Google Sheet.
+    Chỉ ghi các row vừa crawl — KHÔNG đụng vào rows đã có (tránh ghi đè thành empty).
+    """
+    from src.sheets_writer import _get_client, _build_text_format_runs
+    import gspread as _gspread
+
+    results_by_index = {r["index"]: r for r in req.results}
+    if not results_by_index:
+        return {"ok": True, "url": ""}
+
     try:
-        rows = read_from_sheet(spreadsheet_id=req.spreadsheet_id, gid=req.gid, sheet_name=req.sheet_name)
+        client = _get_client()
+        spreadsheet = client.open_by_key(req.spreadsheet_id)
+        if req.gid is not None:
+            sheet = spreadsheet.get_worksheet_by_id(req.gid)
+        else:
+            sheet = spreadsheet.worksheet(req.sheet_name or "Sheet1")
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-    # Merge results vào rows gốc
-    results_by_index = {r["index"]: r for r in req.results}
-    enriched = []
-    for i, row in enumerate(rows):
-        enriched_row = dict(row)
-        if i in results_by_index:
-            r = results_by_index[i]
-            enriched_row["post"] = r.get("post", "")
-            enriched_row["da_crawl"] = bool(r.get("crawled", False))
-        else:
-            enriched_row["post"] = row.get("Bài Viết", "")
-            enriched_row["da_crawl"] = str(row.get("Đã Crawl", "")).upper() == "TRUE"
-        enriched.append(enriched_row)
+    # ── Tìm / tạo cột "Bài Viết" và "Đã Crawl" ──────────────────────────────
+    headers = sheet.row_values(1)
+
+    def _col_idx(header: str) -> int:
+        if header in headers:
+            return headers.index(header) + 1
+        idx = len([h for h in headers if h]) + 1
+        sheet.update_cell(1, idx, header)
+        headers.append(header)
+        return idx
+
+    post_col_idx  = _col_idx("Bài Viết")
+    crawl_col_idx = _col_idx("Đã Crawl")
+
+    max_col = max(post_col_idx, crawl_col_idx)
+    if max_col > sheet.col_count:
+        sheet.resize(cols=max_col + 5)
+
+    # ── Chỉ ghi những row vừa crawl ──────────────────────────────────────────
+    post_requests  = []
+    checkbox_cells = []
+
+    for row_idx, r in results_by_index.items():
+        sheet_row = row_idx + 2   # +1 header, +1 vì 1-based
+        post_text = r.get("post", "")
+        crawled   = bool(r.get("crawled", False))
+
+        # Post cell — với hyperlink formatting nếu có URL
+        runs      = _build_text_format_runs(post_text)
+        cell_data: dict = {"userEnteredValue": {"stringValue": post_text}}
+        if runs:
+            cell_data["textFormatRuns"] = runs
+
+        post_requests.append({
+            "updateCells": {
+                "rows": [{"values": [cell_data]}],
+                "fields": "userEnteredValue,textFormatRuns",
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": sheet_row - 1,
+                    "endRowIndex": sheet_row,
+                    "startColumnIndex": post_col_idx  - 1,
+                    "endColumnIndex":   post_col_idx,
+                },
+            }
+        })
+
+        # Checkbox cell
+        checkbox_cells.append(_gspread.Cell(sheet_row, crawl_col_idx, crawled))
 
     try:
-        url = append_col_with_links(
-            enriched_rows=enriched, spreadsheet_id=req.spreadsheet_id,
-            col_key="post", col_header="Bài Viết",
-            sheet_name=req.sheet_name, gid=req.gid,
-        )
-        append_checkbox_col_to_sheet(
-            enriched_rows=enriched, spreadsheet_id=req.spreadsheet_id,
-            col_key="da_crawl", col_header="Đã Crawl",
-            sheet_name=req.sheet_name, gid=req.gid,
-        )
+        if post_requests:
+            spreadsheet.batch_update({"requests": post_requests})
+
+        if checkbox_cells:
+            sheet.update_cells(checkbox_cells, value_input_option="RAW")
+            # Áp dụng BOOLEAN validation (checkbox UI)
+            row_indices = [c.row for c in checkbox_cells]
+            spreadsheet.batch_update({"requests": [{
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": sheet.id,
+                        "startRowIndex": min(row_indices) - 1,
+                        "endRowIndex":   max(row_indices),
+                        "startColumnIndex": crawl_col_idx - 1,
+                        "endColumnIndex":   crawl_col_idx,
+                    },
+                    "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True},
+                }
+            }]})
+
+        url = f"https://docs.google.com/spreadsheets/d/{req.spreadsheet_id}/edit#gid={sheet.id}"
+        print(f"[linkedin-write] wrote {len(results_by_index)} new row(s) → {url}")
         return {"ok": True, "url": url}
     except Exception as e:
         return {"ok": False, "error": str(e)}

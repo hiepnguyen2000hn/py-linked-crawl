@@ -38,6 +38,16 @@ WEBSITE_HEADERS = ["Tuyển Dụng", "Blog", "Lĩnh Vực", "Dự Án Gần Nh�
 CRAWLED_KEY     = "da_enrich"
 CRAWLED_HEADER  = "Đã Crawl"
 
+# Score columns
+SCORE_COLS = [
+    ("icp_bucket",   "ICP_Bucket"),
+    ("score_total",  "Score_Total"),
+    ("tier",         "Tier"),
+    ("reason_1",     "Reason_1"),
+    ("reason_2",     "Reason_2"),
+    ("reason_3",     "Reason_3"),
+]
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -147,8 +157,8 @@ def main():
         if _is_done(row):
             print(f"  Skip — already enriched (Đã Enrich = TRUE)")
             enriched_row[JOBS_KEY]  = row.get(JOBS_HEADER, "")
-            for k in WEBSITE_KEYS:
-                enriched_row[k] = row.get(k, "")
+            for k, h in zip(WEBSITE_KEYS, WEBSITE_HEADERS):
+                enriched_row[k] = row.get(h, "")   # đọc bằng header thật, không phải Python key
             enriched_row[CRAWLED_KEY] = True
             enriched.append(enriched_row)
             skipped += 1
@@ -181,7 +191,20 @@ def main():
     newly = len(enriched) - skipped
     print(f"\nDone: {newly} enriched, {skipped} skipped.")
 
-    # 3. Ghi tất cả cột về sheet
+    # 3. Scoring — chạy rule-based cho toàn bộ enriched rows
+    from src.score_rule import score_company
+    print(f"\nScoring {len(enriched)} rows ...")
+    for er in enriched:
+        result = score_company(er)
+        er["icp_bucket"]  = result["ICP_Bucket"]
+        er["score_total"] = result["Score_Total"]
+        er["tier"]        = result["Tier"]
+        er["reason_1"]    = result["Reason_1"]
+        er["reason_2"]    = result["Reason_2"]
+        er["reason_3"]    = result["Reason_3"]
+        print(f"  {er.get(args.col_name, '?')[:30]:30s} | {result['Tier']:4s} {result['Score_Total']:3d} | {result['ICP_Bucket']}")
+
+    # 4. Ghi tất cả cột về sheet
     print(f"\nWriting to [{tab_desc}] ...")
 
     kwargs = dict(
@@ -199,6 +222,10 @@ def main():
 
     # Checkbox "Đã Crawl"
     append_checkbox_col_to_sheet(enriched_rows=enriched, col_key=CRAWLED_KEY, col_header=CRAWLED_HEADER, **kwargs)
+
+    # Score columns
+    for key, header in SCORE_COLS:
+        append_col_to_sheet(enriched_rows=enriched, col_key=key, col_header=header, **kwargs)
 
     print(f"\nDone!")
 

@@ -76,7 +76,8 @@ def main():
 
     for i, row in enumerate(rows, 1):
         name = row.get(args.col_name, "") or f"Row {i}"
-        print(f"\n[{i}/{len(rows)}] {name}")
+        icp  = generator.determine_icp(row)
+        print(f"\n[{i}/{len(rows)}] {name} | ICP: {icp}")
 
         enriched_row = dict(row)
 
@@ -90,8 +91,8 @@ def main():
 
         msg = generator.generate(row)
         if msg:
-            preview = msg[:100].replace("\n", " ")
-            print(f"  → {preview}")
+            preview = msg[:120].replace("\n", " ")
+            print(f"  → [{icp}] {preview}")
         else:
             print(f"  → (generation failed)")
 

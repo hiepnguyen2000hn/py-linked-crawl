@@ -169,6 +169,30 @@ async def enrich_sheet(req: EnrichSheetRequest):
     return _make_streaming_response(cmd, "enrich-sheet")
 
 
+class GenConnectMsgRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    regen: bool = False
+
+
+@app.post("/gen-connect-message")
+async def gen_connect_message(req: GenConnectMsgRequest):
+    """
+    Đọc leads từ Google Sheet → DeepSeek sinh LinkedIn connection message → ghi cột Connect_Message.
+    Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20 }
+    Response: text/event-stream — stream stdout, dòng cuối __EXIT__:<code>
+    """
+    script = os.path.join(_HERE, "gen_connect_message.py")
+    cmd = [sys.executable, "-u", script, "--spreadsheet-id", req.spreadsheet_id]
+    if req.gid is not None: cmd += ["--gid", str(req.gid)]
+    if req.sheet_name:      cmd += ["--sheet-name", req.sheet_name]
+    if req.limit:           cmd += ["--limit", str(req.limit)]
+    if req.regen:           cmd += ["--regen"]
+    return _make_streaming_response(cmd, "gen-connect-message")
+
+
 def _make_streaming_response(cmd: list, tag: str, extra_env: dict | None = None):
     """Helper: chạy script qua subprocess, stream stdout qua SSE."""
     import queue, threading, subprocess
@@ -253,7 +277,15 @@ async def linkedin_rows(req: LinkedInRowsRequest):
         url = (row.get(req.col_linkedin, "") or "").strip()
         name = row.get(req.col_name, "") or f"Row {i+1}"
         already = str(row.get("Đã Crawl", "")).upper() == "TRUE" or row.get("Đã Crawl") is True
-        result.append({"index": i, "name": name, "url": url, "already_crawled": already})
+        result.append({
+            "index": i,
+            "name": name,
+            "url": url,
+            "already_crawled": already,
+            "entityUrn": (row.get("entityUrn", "") or "").strip(),
+            "connectStatus": (row.get("connectStatus", "") or "").strip(),
+            "firstName": (row.get("firstName", "") or "").strip(),
+        })
     return {"ok": True, "rows": result, "total": len(rows)}
 
 
@@ -406,6 +438,65 @@ async def linkedin_write(req: LinkedInWriteRequest):
 
         url = f"https://docs.google.com/spreadsheets/d/{req.spreadsheet_id}/edit#gid={sheet.id}"
         print(f"[linkedin-write] wrote {len(results_by_index)} new row(s) → {url}")
+        return {"ok": True, "url": url}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class AutoWriteResult(BaseModel):
+    index: int
+    col_header: str   # e.g. "Connect_Status" or "Message_Sent"
+    col_value: str    # e.g. "pending" or "TRUE"
+
+class AutoWriteRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    results: list[AutoWriteResult]
+
+@app.post("/auto-write")
+async def auto_write(req: AutoWriteRequest):
+    """Ghi cột Connect_Status hoặc Message_Sent về sheet sau auto connect/message."""
+    from src.sheets_writer import _get_client
+    import gspread as _gspread
+
+    if not req.results:
+        return {"ok": True}
+
+    try:
+        client = _get_client()
+        spreadsheet = client.open_by_key(req.spreadsheet_id)
+        if req.gid is not None:
+            sheet = spreadsheet.get_worksheet_by_id(req.gid)
+        else:
+            sheet = spreadsheet.worksheet(req.sheet_name or "Sheet1")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    headers = sheet.row_values(1)
+
+    def _col_idx(header: str) -> int:
+        if header in headers:
+            return headers.index(header) + 1
+        idx = len([h for h in headers if h]) + 1
+        sheet.update_cell(1, idx, header)
+        headers.append(header)
+        return idx
+
+    # Group by col_header to batch updates
+    from collections import defaultdict
+    by_col: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for r in req.results:
+        by_col[r.col_header].append((r.index, r.col_value))
+
+    try:
+        for col_header, entries in by_col.items():
+            col_idx = _col_idx(col_header)
+            cells = [_gspread.Cell(idx + 2, col_idx, val) for idx, val in entries]
+            sheet.update_cells(cells, value_input_option="RAW")
+
+        url = f"https://docs.google.com/spreadsheets/d/{req.spreadsheet_id}/edit#gid={sheet.id}"
+        print(f"[auto-write] wrote {len(req.results)} cell(s) → {url}")
         return {"ok": True, "url": url}
     except Exception as e:
         return {"ok": False, "error": str(e)}

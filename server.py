@@ -111,11 +111,22 @@ def health():
 @app.post("/crawl")
 async def crawl_website(req: CrawlRequest):
     """
-    Crawl 1 URL → trả về markdown.
+    Crawl 1 URL → crawl4ai markdown → DeepSeek extract company profile.
     Body:     { "url": "https://example.com" }
-    Response: { "ok": true, "url": "...", "markdown": "..." }
+    Response: { "ok": true, "url": "...", "markdown": "...",
+                "tuyen_dung": "...", "blog": "...", "linh_vuc": "...",
+                "du_an_gan_nhat": "...", "doi_tac": "..." }
     """
-    return await _crawl_url(req.url)
+    result = await _crawl_url(req.url)
+    if not result["ok"] or not result.get("markdown"):
+        result.update({"tuyen_dung": "", "blog": "", "linh_vuc": "", "du_an_gan_nhat": "", "doi_tac": ""})
+        return result
+
+    from src.company_profile_extractor import CompanyProfileExtractor
+    extractor = CompanyProfileExtractor()
+    profile = extractor.extract(result["markdown"])
+    result.update(profile)
+    return result
 
 
 @app.post("/crawl-sheet")

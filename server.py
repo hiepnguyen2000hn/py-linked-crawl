@@ -238,12 +238,19 @@ def _make_streaming_response(cmd: list, tag: str, extra_env: dict | None = None)
     threading.Thread(target=_run, daemon=True).start()
 
     async def generate():
+        loop = asyncio.get_event_loop()
+        last_data = loop.time()
+        KEEPALIVE_INTERVAL = 20  # giây — đủ ngắn để AWS ALB (60s idle) không cắt
         while True:
             try:
                 item = line_queue.get_nowait()
             except queue.Empty:
+                if loop.time() - last_data >= KEEPALIVE_INTERVAL:
+                    yield ": keepalive\n\n"
+                    last_data = loop.time()
                 await asyncio.sleep(0.05)
                 continue
+            last_data = loop.time()
             yield f"data: {item}\n\n"
             if item.startswith("__EXIT__:") or item.startswith("__ERROR__:"):
                 break

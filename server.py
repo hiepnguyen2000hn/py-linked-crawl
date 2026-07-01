@@ -204,6 +204,31 @@ async def gen_connect_message(req: GenConnectMsgRequest):
     return _make_streaming_response(cmd, "gen-connect-message")
 
 
+class GenCommentRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    regen: bool = False
+
+
+@app.post("/gen-comment")
+async def gen_comment(req: GenCommentRequest):
+    """
+    Đọc bài viết đã crawl (cột "Bài Viết") từ Google Sheet → DeepSeek sinh
+    nội dung comment tự nhiên để tương tác dưới bài viết đó → ghi cột Comment.
+    Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20 }
+    Response: text/event-stream — stream stdout, dòng cuối __EXIT__:<code>
+    """
+    script = os.path.join(_HERE, "gen_comment.py")
+    cmd = [sys.executable, "-u", script, "--spreadsheet-id", req.spreadsheet_id]
+    if req.gid is not None: cmd += ["--gid", str(req.gid)]
+    if req.sheet_name:      cmd += ["--sheet-name", req.sheet_name]
+    if req.limit:           cmd += ["--limit", str(req.limit)]
+    if req.regen:           cmd += ["--regen"]
+    return _make_streaming_response(cmd, "gen-comment")
+
+
 def _make_streaming_response(cmd: list, tag: str, extra_env: dict | None = None):
     """Helper: chạy script qua subprocess, stream stdout qua SSE."""
     import queue, threading, subprocess

@@ -13,6 +13,7 @@ Ví dụ:
 """
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -96,8 +97,10 @@ def _load_cookies_from_env() -> list:
         return []
 
 
-def _crawl_with_playwright_cookies(url: str, cookies: list) -> str:
-    """Playwright với LinkedIn session cookies inject trực tiếp vào browser context."""
+def _crawl_with_playwright_cookies(url: str, cookies: list) -> tuple[str, str]:
+    """Playwright với LinkedIn session cookies inject trực tiếp vào browser context.
+    Returns (text, html) tuple.
+    """
     from playwright.sync_api import sync_playwright
     from bs4 import BeautifulSoup
 
@@ -236,18 +239,18 @@ def _crawl_with_playwright_cookies(url: str, cookies: list) -> str:
             browser.close()
 
     if not html:
-        return ""
+        return "", ""
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator="\n")
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    return "\n".join(lines)
+    return "\n".join(lines), html
 
 
-def _crawl_linkedin(url: str) -> str:
-    """Crawl LinkedIn URL → markdown/text.
+def _crawl_linkedin(url: str) -> tuple[str, str]:
+    """Crawl LinkedIn URL → (text, raw_html).
 
     Ưu tiên: Playwright với cookies (authenticated) > crawl4ai > Playwright ẩn danh
-    Tự động chuyển profile URL → recent-activity/shares/ để lấy nội dung posts.
+    Tự động chuyển profile URL → recent-activity/all/ để lấy đầy đủ posts.
     """
     from src.crawl4ai_crawler import Crawl4AICrawler
 
@@ -261,19 +264,19 @@ def _crawl_linkedin(url: str) -> str:
     if cookies:
         print(f"  Using authenticated Playwright ({len(cookies)} cookies) ...")
         try:
-            content = _crawl_with_playwright_cookies(activity_url, cookies)
-            if content and len(content) > 500:
-                return content
-            print(f"  [playwright+cookies] Too short ({len(content)} chars) — trying crawl4ai ...")
+            text, html = _crawl_with_playwright_cookies(activity_url, cookies)
+            if text and len(text) > 500:
+                return text, html
+            print(f"  [playwright+cookies] Too short ({len(text)} chars) — trying crawl4ai ...")
         except Exception as e:
             print(f"  [playwright+cookies] Error: {e}")
 
-    # Step 2: crawl4ai (headless, không cookies)
+    # Step 2: crawl4ai (headless, không cookies) — không trả về raw HTML
     try:
         crawler = Crawl4AICrawler()
         markdown = crawler.crawl_to_markdown(activity_url)
         if markdown and len(markdown.strip()) > 500:
-            return markdown
+            return markdown, ""
         print(f"  [crawl4ai] Too short ({len(markdown)} chars) — fallback ...")
     except Exception as e:
         print(f"  [crawl4ai] Error: {e}")
@@ -288,11 +291,11 @@ def _crawl_linkedin(url: str) -> str:
             soup = BeautifulSoup(html, "lxml")
             text = soup.get_text(separator="\n")
             lines = [l.strip() for l in text.splitlines() if l.strip()]
-            return "\n".join(lines)
+            return "\n".join(lines), html
     except Exception as e:
         print(f"  [browser_fetcher] Error: {e}")
 
-    return ""
+    return "", ""
 
 
 def main():
@@ -354,7 +357,18 @@ def main():
             continue
 
         print(f"  Crawling {linkedin_url} ...")
-        content = _crawl_linkedin(linkedin_url)
+        content, raw_html = _crawl_linkedin(linkedin_url)
+
+        # Save HTML for debug on every crawl
+        if raw_html:
+            safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name or "unknown")[:40]
+            try:
+                debug_path = f"/tmp/linkedin_sheet_{safe_name}.html"
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(raw_html)
+                print(f"  [debug] saved HTML → {debug_path}")
+            except Exception as _e:
+                pass
 
         enriched_row = dict(row)
         if not content:
@@ -362,11 +376,10 @@ def main():
             enriched_row[POST_KEY] = ""
             enriched_row[CRAWLED_KEY] = False
         else:
-            print(f"  Extracting posts ({len(content)} chars) ...")
-            # Debug: in 300 chars đầu để thấy LinkedIn trả về gì
+            print(f"  Extracting posts ({len(content)} chars, html={len(raw_html)} chars) ...")
             preview = content[:300].replace('\n', ' ')
             print(f"  [preview] {preview}")
-            posts = extractor.extract(content)
+            posts = extractor.extract(content, html=raw_html or None)
             val = posts.get(POST_KEY, "")
             if val:
                 print(f"    post: {val[:200].replace(chr(10), ' ')}")

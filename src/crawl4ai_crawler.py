@@ -36,17 +36,6 @@ class Crawl4AICrawler:
         from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
         from crawl4ai.content_filter_strategy import PruningContentFilter
 
-        # Build Cookie header string từ cookie list
-        extra_headers = {}
-        if cookies:
-            cookie_str = "; ".join(
-                f"{c['name']}={c['value']}"
-                for c in cookies
-                if c.get('name') and c.get('value')
-            )
-            if cookie_str:
-                extra_headers["Cookie"] = cookie_str
-
         run_config = CrawlerRunConfig(
             markdown_generator=DefaultMarkdownGenerator(
                 content_filter=PruningContentFilter(),
@@ -57,7 +46,8 @@ class Crawl4AICrawler:
         browser_config = BrowserConfig(
             headless=True,
             verbose=False,
-            headers=extra_headers if extra_headers else {},
+            cookies=cookies if cookies else None,  # Pass cookies to browser context (NOT HTTP headers)
+            enable_stealth=True,  # Enable stealth mode to bypass LinkedIn detection
         )
 
         async with AsyncWebCrawler(config=browser_config) as crawler:

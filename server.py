@@ -204,6 +204,33 @@ async def gen_connect_message(req: GenConnectMsgRequest):
     return _make_streaming_response(cmd, "gen-connect-message")
 
 
+class GenPostCommentRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    post_col: str = "Bài Viết"
+    limit: int | None = None
+    regen: bool = False
+
+
+@app.post("/gen-post-comment")
+async def gen_post_comment(req: GenPostCommentRequest):
+    """
+    Đọc cột "Bài Viết" từ Google Sheet → DeepSeek sinh comment để thả dưới bài viết
+    → ghi cột Post_Comment.
+    Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20 }
+    Response: text/event-stream — stream stdout, dòng cuối __EXIT__:<code>
+    """
+    script = os.path.join(_HERE, "gen_post_comment.py")
+    cmd = [sys.executable, "-u", script, "--spreadsheet-id", req.spreadsheet_id]
+    if req.gid is not None: cmd += ["--gid", str(req.gid)]
+    if req.sheet_name:      cmd += ["--sheet-name", req.sheet_name]
+    if req.post_col:        cmd += ["--post-col", req.post_col]
+    if req.limit:           cmd += ["--limit", str(req.limit)]
+    if req.regen:           cmd += ["--regen"]
+    return _make_streaming_response(cmd, "gen-post-comment")
+
+
 def _make_streaming_response(cmd: list, tag: str, extra_env: dict | None = None):
     """Helper: chạy script qua subprocess, stream stdout qua SSE."""
     import queue, threading, subprocess
@@ -266,6 +293,7 @@ class LinkedInRowsRequest(BaseModel):
     limit: int | None = None
     col_linkedin: str = "linkedUrl"
     col_name: str = "fullName"
+    col_message: str | None = None
 
 class LinkedInExtractRequest(BaseModel):
     text: str
@@ -303,6 +331,7 @@ async def linkedin_rows(req: LinkedInRowsRequest):
             "entityUrn": (row.get("entityUrn", "") or "").strip(),
             "connectStatus": (row.get("connectStatus", "") or "").strip(),
             "firstName": (row.get("firstName", "") or "").strip(),
+            "message": (row.get(req.col_message, "") or "").strip() if req.col_message else "",
         })
     return {"ok": True, "rows": result, "total": len(rows)}
 
@@ -318,7 +347,7 @@ def _html_to_markdown(html: str) -> str:
         )
         # crawl4ai generator nhận raw HTML string
         result = generator.generate_markdown(
-            cleaned_html=html,
+            input_html=html,
             base_url="https://www.linkedin.com",
         )
         return result.fit_markdown or result.raw_markdown or ""
@@ -350,12 +379,26 @@ async def linkedin_extract(req: LinkedInExtractRequest):
         markdown = await loop.run_in_executor(pool, _html_to_markdown, req.text)
 
     print(f"[linkedin-extract] {req.name}: {len(req.text)} chars HTML → {len(markdown)} chars markdown")
+    # Debug: print first 500 chars of markdown để biết content có đúng không
+    preview = markdown[:500].replace('\n', ' ')
+    print(f"[linkedin-extract] markdown preview: {preview}")
 
     if len(markdown.strip()) < 100:
         return {"ok": False, "post": "", "error": "Markdown too short after conversion"}
 
+    # Debug: save HTML + markdown ra /tmp khi cần inspect
+    try:
+        safe_name = (req.name or "unknown").replace(" ", "_").replace("/", "_")[:30]
+        with open(f"/tmp/linkedin_debug_{safe_name}.html", "w", encoding="utf-8") as f:
+            f.write(req.text)
+        with open(f"/tmp/linkedin_debug_{safe_name}.md", "w", encoding="utf-8") as f:
+            f.write(markdown)
+        print(f"[linkedin-extract] saved debug files: /tmp/linkedin_debug_{safe_name}.*")
+    except Exception:
+        pass
+
     extractor = LinkedInPostExtractor(api_key=api_key)
-    result = extractor.extract(markdown)
+    result = extractor.extract(markdown, html=req.text)
     post = result.get("post", "")
     print(f"[linkedin-extract] {req.name}: post={'yes' if post else 'empty'}")
     return {"ok": True, "post": post}

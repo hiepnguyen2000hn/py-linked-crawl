@@ -16,5 +16,9 @@ response_deepseek/
 .idea/
 .vscode/
 
+# Virtualenv
+venv/
+.venv/
+
 # Claude memory
 CLAUDE.md

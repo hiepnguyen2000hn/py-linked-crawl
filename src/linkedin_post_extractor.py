@@ -213,12 +213,12 @@ The content below is from a LinkedIn recent-activity/all/ page.
 
 ## Task
 From the full text content below, extract the 3 most recent posts (newest first).
+SKIP pure reposts (type 2) — only include type 1 (original) and type 3 (repost with own thoughts).
 For each post:
 - Copy the EXACT activityId and url from metadata (match by text preview similarity)
-- Use the type from metadata (1=original, 2=pure repost, 3=repost with own thoughts)
+- Use the type from metadata (1=original, 3=repost with own thoughts)
 - Extract FULL content, keep original wording, do NOT summarize or translate
 - REMOVE all reaction/like/comment/share counts (numbers like "1,234 reactions", "45 comments")
-- type 2: content = "(Repost of [author]: [original post text])"
 - type 3: content = "[user's added thought] | Reshared: [original post snippet]"
 
 Return ONLY valid JSON:
@@ -237,12 +237,12 @@ LinkedIn activity page content:
 
 _USER_TEMPLATE_NO_META = """\
 The content below is from a LinkedIn recent-activity/all/ page (posts, comments, reposts mixed).
-Extract the 3 most recent posts (skip comments on others' posts).
+Extract the 3 most recent posts (skip comments on others' posts, skip pure reposts with no added text).
 
 Classify type:
 - type 1: user wrote it themselves (original)
-- type 2: pure repost, no added text
 - type 3: repost with user's own thoughts
+(Do NOT include type 2 pure reposts)
 
 Return ONLY valid JSON:
 {{
@@ -313,9 +313,10 @@ class LinkedInPostExtractor:
 
         # Build prompt
         if posts_meta:
+            non_repost_meta = [m for m in posts_meta if m["type"] != 2]
             meta_lines = []
-            for i, m in enumerate(posts_meta[:10], 1):
-                type_label = {1: "original", 2: "repost", 3: "repost+thought"}.get(m["type"], "?")
+            for i, m in enumerate(non_repost_meta[:10], 1):
+                type_label = {1: "original", 3: "repost+thought"}.get(m["type"], "?")
                 preview = m["user_text"][:100].replace("\n", " ") if m["user_text"] else "(no text detected)"
                 meta_lines.append(
                     f"{i}. activityId={m['activityId']} | type={m['type']}({type_label}) | url={m['url']} | preview: {preview}"

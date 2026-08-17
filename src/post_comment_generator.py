@@ -42,6 +42,11 @@ WRITING RULES
 - Optionally close with ONE short, specific, answerable question tied to that detail and calibrated to the author's role.
 - Vary sentence rhythm and opening structure across different leads — do not default to a fixed template like "X stood out to me, I wonder Y" every time.
 
+HUMANIZATION — the final comment must read like a real person typed it, not an AI
+- Introduce subtle natural imperfections: slightly uneven rhythm, one casual word swap, a phrase that feels off-the-cuff
+- Do NOT add filler words ("just", "really", "honestly", "actually") more than once
+- Still reads as thoughtful — just less polished, more spontaneous
+
 STRICT CONSTRAINTS — the comment must NOT:
 - Mention, hint at, or imply any company, product, or service (including the BDE's own employer)
 - Mention the lead's name, company name, or location directly in the comment text
@@ -90,8 +95,8 @@ class PostCommentGenerator:
 
     def generate(self, row: dict, post_col: str = "Bài Viết") -> str:
         """
-        Generate a comment for one row's post content.
-        Returns comment string (≤300 chars), or "" if no post content or on failure.
+        Generate a humanized LinkedIn comment for one row's post content.
+        Returns comment string, or "" if no post content or on failure.
         """
         post_content = _get(row, post_col)
         if len(post_content) < 30:
@@ -115,7 +120,7 @@ class PostCommentGenerator:
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user",   "content": prompt},
                 ],
-                temperature=0.7,
+                temperature=0.85,
                 max_tokens=150,
             )
             comment = (response.choices[0].message.content or "").strip()

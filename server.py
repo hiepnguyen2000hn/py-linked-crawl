@@ -10,7 +10,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -25,6 +25,72 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Supabase JWT Auth ─────────────────────────────────────────────────────────
+
+_JWT_SECRET   = os.getenv("SUPABASE_JWT_SECRET", "")
+_REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+
+
+_jwks_cache: dict | None = None
+_jwks_fetched_at: float = 0.0
+
+def _get_jwks() -> dict:
+    """Fetch JWKS từ Supabase (cache 10 phút)."""
+    import time, requests as _req
+    global _jwks_cache, _jwks_fetched_at
+    if _jwks_cache and (time.time() - _jwks_fetched_at) < 600:
+        return _jwks_cache
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    if not supabase_url:
+        return {}
+    try:
+        r = _req.get(f"{supabase_url}/auth/v1/.well-known/jwks.json", timeout=5)
+        _jwks_cache = r.json()
+        _jwks_fetched_at = time.time()
+        return _jwks_cache
+    except Exception:
+        return {}
+
+
+def _verify_jwt(token: str) -> dict:
+    """
+    Verify Supabase JWT — hỗ trợ cả 2 key types:
+      - ECC P-256 (ES256)  ← current key mới
+      - HS256 shared secret ← legacy key cũ
+    """
+    from jose import jwt as _jwt, JWTError
+
+    # 1. Thử JWKS (ES256 / ECC P-256) — current key
+    jwks = _get_jwks()
+    if jwks.get("keys"):
+        try:
+            return _jwt.decode(token, jwks, algorithms=["ES256", "RS256"],
+                               audience="authenticated")
+        except Exception:
+            pass  # fallback xuống HS256
+
+    # 2. Fallback: Legacy HS256 shared secret
+    if _JWT_SECRET:
+        try:
+            return _jwt.decode(token, _JWT_SECRET, algorithms=["HS256"],
+                               audience="authenticated")
+        except Exception as exc:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
+    raise HTTPException(status_code=401, detail="Cannot verify token: no JWT secret or JWKS configured")
+
+
+async def require_auth(authorization: str | None = Header(default=None)) -> dict:
+    """FastAPI dependency — trả về JWT payload hoặc raise 401."""
+    if not _REQUIRE_AUTH:
+        return {}  # dev mode: bỏ qua auth
+    if not _JWT_SECRET:
+        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    return _verify_jwt(authorization[7:])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,7 +175,7 @@ def health():
 
 
 @app.post("/crawl")
-async def crawl_website(req: CrawlRequest):
+async def crawl_website(req: CrawlRequest, _user: dict = Depends(require_auth)):
     """
     Crawl 1 URL → crawl4ai markdown → DeepSeek extract company profile.
     Body:     { "url": "https://example.com" }
@@ -130,7 +196,7 @@ async def crawl_website(req: CrawlRequest):
 
 
 @app.post("/crawl-sheet")
-async def crawl_from_sheet(req: CrawlSheetRequest):
+async def crawl_from_sheet(req: CrawlSheetRequest, _user: dict = Depends(require_auth)):
     """
     Đọc danh sách URL từ Google Sheet → crawl từng URL → trả về kết quả.
     Body:     { "spreadsheet_id": "...", "gid": 0, "url_column": "website" }
@@ -165,7 +231,7 @@ async def crawl_from_sheet(req: CrawlSheetRequest):
 
 
 @app.post("/enrich-sheet")
-async def enrich_sheet(req: EnrichSheetRequest):
+async def enrich_sheet(req: EnrichSheetRequest, _user: dict = Depends(require_auth)):
     """
     Gọi from_sheet_full_enrich.py và stream stdout line-by-line qua SSE.
     Body:     { "spreadsheet_id": "...", "gid": 1694881147, "limit": 15 }
@@ -189,7 +255,7 @@ class GenConnectMsgRequest(BaseModel):
 
 
 @app.post("/gen-connect-message")
-async def gen_connect_message(req: GenConnectMsgRequest):
+async def gen_connect_message(req: GenConnectMsgRequest, _user: dict = Depends(require_auth)):
     """
     Đọc leads từ Google Sheet → DeepSeek sinh LinkedIn connection message → ghi cột Connect_Message.
     Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20 }
@@ -214,7 +280,7 @@ class GenPostCommentRequest(BaseModel):
 
 
 @app.post("/gen-post-comment")
-async def gen_post_comment(req: GenPostCommentRequest):
+async def gen_post_comment(req: GenPostCommentRequest, _user: dict = Depends(require_auth)):
     """
     Đọc cột "Bài Viết" từ Google Sheet → DeepSeek sinh comment để thả dưới bài viết
     → ghi cột Post_Comment.
@@ -309,7 +375,7 @@ class LinkedInWriteRequest(BaseModel):
 
 
 @app.post("/linkedin-rows")
-async def linkedin_rows(req: LinkedInRowsRequest):
+async def linkedin_rows(req: LinkedInRowsRequest, _user: dict = Depends(require_auth)):
     """Đọc sheet, trả về danh sách rows chưa crawl (có linkedUrl)."""
     from src.sheets_writer import read_from_sheet
     try:
@@ -361,7 +427,7 @@ def _html_to_markdown(html: str) -> str:
 
 
 @app.post("/linkedin-extract")
-async def linkedin_extract(req: LinkedInExtractRequest):
+async def linkedin_extract(req: LinkedInExtractRequest, _user: dict = Depends(require_auth)):
     """HTML → markdown (crawl4ai) → DeepSeek extract posts."""
     import os as _os
     from src.linkedin_post_extractor import LinkedInPostExtractor
@@ -405,7 +471,7 @@ async def linkedin_extract(req: LinkedInExtractRequest):
 
 
 @app.post("/linkedin-write")
-async def linkedin_write(req: LinkedInWriteRequest):
+async def linkedin_write(req: LinkedInWriteRequest, _user: dict = Depends(require_auth)):
     """Ghi kết quả posts vào Google Sheet.
     Chỉ ghi các row vừa crawl — KHÔNG đụng vào rows đã có (tránh ghi đè thành empty).
     """
@@ -516,7 +582,7 @@ class AutoWriteRequest(BaseModel):
     results: list[AutoWriteResult]
 
 @app.post("/auto-write")
-async def auto_write(req: AutoWriteRequest):
+async def auto_write(req: AutoWriteRequest, _user: dict = Depends(require_auth)):
     """Ghi cột Connect_Status hoặc Message_Sent về sheet sau auto connect/message."""
     from src.sheets_writer import _get_client
     import gspread as _gspread
@@ -564,7 +630,7 @@ async def auto_write(req: AutoWriteRequest):
 
 
 @app.post("/linkedin-sheet")
-async def linkedin_sheet(req: LinkedInSheetRequest):
+async def linkedin_sheet(req: LinkedInSheetRequest, _user: dict = Depends(require_auth)):
     """
     Chạy from_sheet_linkedin.py — crawl LinkedIn posts từ sheet.
     Body: { spreadsheet_id, gid, limit, col_linkedin, col_name, cookies? }
@@ -584,3 +650,547 @@ async def linkedin_sheet(req: LinkedInSheetRequest):
         extra_env["LINKEDIN_COOKIES_JSON"] = _json.dumps(req.cookies)
         print(f"[linkedin-sheet] Passing {len(req.cookies)} LinkedIn cookies to subprocess")
     return _make_streaming_response(cmd, "linkedin-sheet", extra_env=extra_env)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SALES INTELLIGENCE ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Shared sheet helper ───────────────────────────────────────────────────────
+
+def _open_sheet(spreadsheet_id: str, gid: int | None, sheet_name: str | None):
+    """Mở worksheet, trả về (spreadsheet, sheet)."""
+    from src.sheets_writer import _get_client
+    import gspread as _gspread
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+    if gid is not None:
+        sheet = spreadsheet.get_worksheet_by_id(gid)
+    else:
+        sheet = spreadsheet.worksheet(sheet_name or "Sheet1")
+    return spreadsheet, sheet
+
+
+def _ensure_col(sheet, headers: list[str], header: str) -> int:
+    """Trả về index cột (1-based), tạo mới nếu chưa có."""
+    if header in headers:
+        return headers.index(header) + 1
+    idx = len([h for h in headers if h]) + 1
+    sheet.update_cell(1, idx, header)
+    headers.append(header)
+    return idx
+
+
+# ── /find-email ───────────────────────────────────────────────────────────────
+
+class FindEmailRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    col_name: str = "fullName"
+    col_domain: str = "domain"          # cột chứa domain website công ty
+
+
+@app.post("/find-email")
+async def find_email_endpoint(req: FindEmailRequest, _user: dict = Depends(require_auth)):
+    """
+    Đọc sheet → tìm email từng lead → ghi cột Email_Found + Email_Confidence.
+    Streaming SSE: mỗi dòng là 1 log, kết thúc bằng __EXIT__:0.
+    """
+    async def _generate():
+        from src.sheets_writer import read_from_sheet
+        from src.email_finder import find_emails_batch
+        import gspread as _gs
+
+        def _emit(text: str):
+            return f"data: {text}\n\n"
+
+        try:
+            rows = read_from_sheet(
+                spreadsheet_id=req.spreadsheet_id,
+                gid=req.gid,
+                sheet_name=req.sheet_name,
+            )
+            if req.limit:
+                rows = rows[:req.limit]
+
+            yield _emit(f"Đọc sheet: {len(rows)} dòng")
+
+            results = find_emails_batch(rows, name_col=req.col_name, domain_col=req.col_domain)
+
+            # Ghi kết quả vào sheet
+            _, sheet = _open_sheet(req.spreadsheet_id, req.gid, req.sheet_name)
+            headers = sheet.row_values(1)
+            email_col = _ensure_col(sheet, headers, "Email_Found")
+            conf_col  = _ensure_col(sheet, headers, "Email_Confidence")
+
+            cells = []
+            for r in results:
+                if r.get("email"):
+                    row_idx = r["index"] + 2
+                    cells.append(_gs.Cell(row_idx, email_col, r["email"]))
+                    cells.append(_gs.Cell(row_idx, conf_col, r["confidence"]))
+                    yield _emit(f"✓ {rows[r['index']].get(req.col_name, '?')} → {r['email']} ({r['confidence']}%)")
+                else:
+                    yield _emit(f"– {rows[r['index']].get(req.col_name, '?')} → không tìm thấy")
+
+            if cells:
+                sheet.update_cells(cells, value_input_option="RAW")
+
+            found = sum(1 for r in results if r.get("email"))
+            yield _emit(f"✓ Hoàn tất: {found}/{len(results)} emails tìm thấy")
+            yield "data: __EXIT__:0\n\n"
+
+        except Exception as e:
+            yield _emit(f"✗ Lỗi: {e}")
+            yield "data: __EXIT__:1\n\n"
+
+    from fastapi.responses import StreamingResponse as SR
+    return SR(_generate(), media_type="text/event-stream")
+
+
+# ── /score-leads ──────────────────────────────────────────────────────────────
+
+class ScoreLeadsRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    col_name: str = "fullName"
+    col_title: str = "title"
+    col_company: str = "company"
+    col_industry: str = "industry"
+    col_post: str = "Bài Viết"
+    regen: bool = False
+    provider_config: ProviderConfig = ProviderConfig()
+
+
+@app.post("/score-leads")
+async def score_leads_endpoint(req: ScoreLeadsRequest, _user: dict = Depends(require_auth)):
+    """
+    Đọc sheet → AI chấm ICP score từng lead → ghi ICP_Score, ICP_Tier, ICP_Priority, ICP_Reason.
+    Streaming SSE.
+    """
+    async def _generate():
+        from src.sheets_writer import read_from_sheet
+        from src.icp_scorer import ICPScorer
+        import gspread as _gs
+
+        def _emit(text: str):
+            return f"data: {text}\n\n"
+
+        try:
+            rows = read_from_sheet(
+                spreadsheet_id=req.spreadsheet_id,
+                gid=req.gid,
+                sheet_name=req.sheet_name,
+            )
+            if req.limit:
+                rows = rows[:req.limit]
+
+            # Lọc bỏ rows đã có điểm (nếu không regen)
+            to_score = []
+            for i, row in enumerate(rows):
+                if not req.regen and row.get("ICP_Score"):
+                    continue
+                to_score.append({
+                    "index":        i,
+                    "name":         row.get(req.col_name, ""),
+                    "title":        row.get(req.col_title, ""),
+                    "company":      row.get(req.col_company, ""),
+                    "industry":     row.get(req.col_industry, ""),
+                    "recent_post":  row.get(req.col_post, ""),
+                    "about":        row.get("about", ""),
+                    "company_size": row.get("companySize", ""),
+                })
+
+            yield _emit(f"Cần chấm: {len(to_score)}/{len(rows)} leads")
+
+            if not to_score:
+                yield _emit("✓ Tất cả đã có điểm. Dùng regen=true để chấm lại.")
+                yield "data: __EXIT__:0\n\n"
+                return
+
+            ai_router = _build_ai_router(req.provider_config)
+            scorer = ICPScorer(ai_router=ai_router)
+            _, sheet = _open_sheet(req.spreadsheet_id, req.gid, req.sheet_name)
+            headers = sheet.row_values(1)
+            score_col    = _ensure_col(sheet, headers, "ICP_Score")
+            tier_col     = _ensure_col(sheet, headers, "ICP_Tier")
+            priority_col = _ensure_col(sheet, headers, "ICP_Priority")
+            reason_col   = _ensure_col(sheet, headers, "ICP_Reason")
+            approach_col = _ensure_col(sheet, headers, "ICP_Approach")
+
+            for i, lead in enumerate(to_score):
+                result = scorer.score_lead(lead)
+                row_idx = lead["index"] + 2
+
+                cells = [
+                    _gs.Cell(row_idx, score_col,    result.get("icp_score", 0)),
+                    _gs.Cell(row_idx, tier_col,     result.get("tier", "D")),
+                    _gs.Cell(row_idx, priority_col, result.get("priority", "Low")),
+                    _gs.Cell(row_idx, reason_col,   result.get("reasons", "")),
+                    _gs.Cell(row_idx, approach_col, result.get("suggested_approach", "")),
+                ]
+                sheet.update_cells(cells, value_input_option="RAW")
+
+                score = result.get("icp_score", 0)
+                tier  = result.get("tier", "?")
+                name  = lead.get("name", "?")
+                yield _emit(f"[{i+1}/{len(to_score)}] {name} → {score}/100 Tier {tier} | {result.get('reasons', '')[:80]}")
+
+            yield _emit(f"✓ Hoàn tất chấm điểm {len(to_score)} leads")
+            yield "data: __EXIT__:0\n\n"
+
+        except Exception as e:
+            yield _emit(f"✗ Lỗi: {e}")
+            yield "data: __EXIT__:1\n\n"
+
+    from fastapi.responses import StreamingResponse as SR
+    return SR(_generate(), media_type="text/event-stream")
+
+
+# ── /lead-status ──────────────────────────────────────────────────────────────
+
+VALID_STATUSES = ["cold", "contacted", "replied", "meeting", "proposal", "closed_won", "closed_lost", "nurturing"]
+
+class LeadStatusRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+
+
+class LeadStatusUpdateRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    updates: list[dict]   # [{ index, status, note? }]
+
+
+@app.post("/lead-status")
+async def get_lead_statuses(req: LeadStatusRequest, _user: dict = Depends(require_auth)):
+    """Đọc tất cả lead và trạng thái hiện tại — trả về summary + list."""
+    from src.sheets_writer import read_from_sheet
+    from collections import Counter
+
+    try:
+        rows = read_from_sheet(
+            spreadsheet_id=req.spreadsheet_id,
+            gid=req.gid,
+            sheet_name=req.sheet_name,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    leads = []
+    for i, row in enumerate(rows):
+        leads.append({
+            "index":     i,
+            "name":      row.get("fullName", f"Row {i+1}"),
+            "company":   row.get("company", ""),
+            "title":     row.get("title", ""),
+            "status":    row.get("Lead_Status", "cold"),
+            "icp_score": row.get("ICP_Score", ""),
+            "icp_tier":  row.get("ICP_Tier", ""),
+            "note":      row.get("Lead_Note", ""),
+            "email":     row.get("Email_Found", ""),
+        })
+
+    status_counts = Counter(l["status"] or "cold" for l in leads)
+    return {
+        "ok":     True,
+        "total":  len(leads),
+        "leads":  leads,
+        "summary": dict(status_counts),
+    }
+
+
+@app.post("/lead-status/update")
+async def update_lead_statuses(req: LeadStatusUpdateRequest, _user: dict = Depends(require_auth)):
+    """Cập nhật Lead_Status (và Lead_Note) cho các row được chọn."""
+    import gspread as _gs
+
+    if not req.updates:
+        return {"ok": True}
+
+    try:
+        _, sheet = _open_sheet(req.spreadsheet_id, req.gid, req.sheet_name)
+        headers  = sheet.row_values(1)
+        status_col = _ensure_col(sheet, headers, "Lead_Status")
+        note_col   = _ensure_col(sheet, headers, "Lead_Note")
+
+        cells = []
+        for u in req.updates:
+            row_idx = u["index"] + 2
+            status  = u.get("status", "cold")
+            note    = u.get("note", "")
+            cells.append(_gs.Cell(row_idx, status_col, status))
+            if note:
+                cells.append(_gs.Cell(row_idx, note_col, note))
+
+        sheet.update_cells(cells, value_input_option="RAW")
+        return {"ok": True, "updated": len(req.updates)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-PROVIDER ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProviderConfig(BaseModel):
+    """Config block gửi kèm từ extension (override .env)."""
+    # Email
+    email_providers:    list[str] = ["hunter", "apollo", "snov", "pattern"]
+    hunter_api_key:     str = ""
+    apollo_api_key:     str = ""
+    snov_client_id:     str = ""
+    snov_client_secret: str = ""
+    # AI
+    ai_providers:      list[str] = ["deepseek", "openai", "claude", "gemini"]
+    deepseek_api_key:  str = ""
+    openai_api_key:    str = ""
+    claude_api_key:    str = ""
+    gemini_api_key:    str = ""
+    openai_model:      str = ""
+    claude_model:      str = ""
+    # CRM
+    crm_providers:       list[str] = []
+    hubspot_api_key:     str = ""
+    notion_token:        str = ""
+    notion_database_id:  str = ""
+
+
+def _build_email_enricher(cfg: ProviderConfig):
+    from src.providers.email_providers import EmailEnricher
+    return EmailEnricher.from_config({
+        "providers":         cfg.email_providers,
+        "hunter_api_key":    cfg.hunter_api_key,
+        "apollo_api_key":    cfg.apollo_api_key,
+        "snov_client_id":    cfg.snov_client_id,
+        "snov_client_secret":cfg.snov_client_secret,
+    })
+
+
+def _build_ai_router(cfg: ProviderConfig):
+    from src.providers.ai_providers import AIRouter
+    return AIRouter.from_config({
+        "providers":       cfg.ai_providers,
+        "deepseek_api_key":cfg.deepseek_api_key,
+        "openai_api_key":  cfg.openai_api_key,
+        "claude_api_key":  cfg.claude_api_key,
+        "gemini_api_key":  cfg.gemini_api_key,
+        "openai_model":    cfg.openai_model,
+        "claude_model":    cfg.claude_model,
+    })
+
+
+def _build_crm_syncer(cfg: ProviderConfig):
+    from src.providers.crm_providers import CRMSyncer
+    return CRMSyncer.from_config({
+        "providers":          cfg.crm_providers,
+        "hubspot_api_key":    cfg.hubspot_api_key,
+        "notion_token":       cfg.notion_token,
+        "notion_database_id": cfg.notion_database_id,
+    })
+
+
+# ── GET /providers/status ─────────────────────────────────────────────────────
+
+@app.post("/providers/status")
+async def providers_status(cfg: ProviderConfig, _user: dict = Depends(require_auth)):
+    """Trả về trạng thái configured/not của từng provider."""
+    email_enricher = _build_email_enricher(cfg)
+    ai_router      = _build_ai_router(cfg)
+    crm_syncer     = _build_crm_syncer(cfg)
+    return {
+        "ok":    True,
+        "email": email_enricher.status(),
+        "ai":    ai_router.status(),
+        "crm":   crm_syncer.status(),
+    }
+
+
+# ── POST /providers/test ──────────────────────────────────────────────────────
+
+class TestProviderRequest(BaseModel):
+    provider: str   # e.g. "hunter", "openai", "hubspot"
+    cfg: ProviderConfig = ProviderConfig()
+
+
+@app.post("/providers/test")
+async def test_provider(req: TestProviderRequest, _user: dict = Depends(require_auth)):
+    """Test kết nối 1 provider cụ thể."""
+    p = req.provider.lower()
+    cfg = req.cfg
+    try:
+        if p == "hunter":
+            from src.providers.email_providers import HunterProvider
+            return HunterProvider(cfg.hunter_api_key).test_connection()
+        if p == "apollo":
+            from src.providers.email_providers import ApolloProvider
+            return ApolloProvider(cfg.apollo_api_key).test_connection()
+        if p == "snov":
+            from src.providers.email_providers import SnovProvider
+            return SnovProvider(cfg.snov_client_id, cfg.snov_client_secret).test_connection()
+        if p == "pattern":
+            from src.providers.email_providers import PatternProvider
+            return PatternProvider().test_connection()
+        if p == "deepseek":
+            from src.providers.ai_providers import DeepSeekProvider
+            return DeepSeekProvider(cfg.deepseek_api_key).test_connection()
+        if p == "openai":
+            from src.providers.ai_providers import OpenAIProvider
+            return OpenAIProvider(cfg.openai_api_key, cfg.openai_model).test_connection()
+        if p == "claude":
+            from src.providers.ai_providers import ClaudeProvider
+            return ClaudeProvider(cfg.claude_api_key, cfg.claude_model).test_connection()
+        if p == "gemini":
+            from src.providers.ai_providers import GeminiProvider
+            return GeminiProvider(cfg.gemini_api_key).test_connection()
+        if p == "hubspot":
+            from src.providers.crm_providers import HubSpotProvider
+            return HubSpotProvider(cfg.hubspot_api_key).test_connection()
+        if p == "notion":
+            from src.providers.crm_providers import NotionProvider
+            return NotionProvider(cfg.notion_token, cfg.notion_database_id).test_connection()
+        return {"ok": False, "message": f"Unknown provider: {p}"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+# ── POST /crm/sync ────────────────────────────────────────────────────────────
+
+class CRMSyncRequest(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    provider_config: ProviderConfig = ProviderConfig()
+
+
+@app.post("/crm/sync")
+async def crm_sync(req: CRMSyncRequest, _user: dict = Depends(require_auth)):
+    """
+    Đọc sheet → map sang CRMContact → push tới các CRM providers.
+    Streaming SSE.
+    """
+    async def _generate():
+        from src.sheets_writer import read_from_sheet
+        from src.providers.crm_providers import CRMContact
+
+        def emit(text: str): return f"data: {text}\n\n"
+
+        try:
+            rows = read_from_sheet(
+                spreadsheet_id=req.spreadsheet_id,
+                gid=req.gid, sheet_name=req.sheet_name,
+            )
+            if req.limit: rows = rows[:req.limit]
+            yield emit(f"Đọc sheet: {len(rows)} rows")
+
+            crm = _build_crm_syncer(req.provider_config)
+            if not crm.providers:
+                yield emit("⚠ Không có CRM provider nào được cấu hình")
+                yield "data: __EXIT__:1\n\n"; return
+
+            contacts = []
+            for i, row in enumerate(rows):
+                contacts.append(CRMContact(
+                    name=row.get("fullName", ""),
+                    email=row.get("Email_Found", "") or row.get("email", ""),
+                    title=row.get("title", ""),
+                    company=row.get("company", ""),
+                    linkedin_url=row.get("linkedUrl", ""),
+                    status=row.get("Lead_Status", "cold"),
+                    icp_score=int(row.get("ICP_Score", 0) or 0),
+                    icp_tier=row.get("ICP_Tier", ""),
+                    notes=row.get("ICP_Reason", ""),
+                    source_row=i,
+                ))
+
+            results = crm.sync(contacts)
+            for r in results:
+                yield emit(f"✓ {r.provider}: created={r.created} updated={r.updated} errors={len(r.errors)}")
+                for err in r.errors[:5]:
+                    yield emit(f"  ✗ {err}")
+
+            yield emit(f"✓ CRM sync hoàn tất")
+            yield "data: __EXIT__:0\n\n"
+        except Exception as e:
+            yield emit(f"✗ {e}")
+            yield "data: __EXIT__:1\n\n"
+
+    from fastapi.responses import StreamingResponse as SR
+    return SR(_generate(), media_type="text/event-stream")
+
+
+# ── POST /find-email với multi-provider ───────────────────────────────────────
+# Override endpoint cũ để dùng EmailEnricher
+
+class FindEmailV2Request(BaseModel):
+    spreadsheet_id: str
+    gid: int | None = None
+    sheet_name: str | None = None
+    limit: int | None = None
+    col_name: str = "fullName"
+    col_domain: str = "domain"
+    provider_config: ProviderConfig = ProviderConfig()
+
+
+@app.post("/find-email/v2")
+async def find_email_v2(req: FindEmailV2Request, _user: dict = Depends(require_auth)):
+    """Email finder dùng multi-provider waterfall."""
+    async def _generate():
+        from src.sheets_writer import read_from_sheet
+        import gspread as _gs
+
+        def emit(t): return f"data: {t}\n\n"
+        try:
+            rows = read_from_sheet(
+                spreadsheet_id=req.spreadsheet_id,
+                gid=req.gid, sheet_name=req.sheet_name,
+            )
+            if req.limit: rows = rows[:req.limit]
+            yield emit(f"Đọc sheet: {len(rows)} dòng")
+
+            enricher = _build_email_enricher(req.provider_config)
+            active = [p["name"] for p in enricher.status() if p["configured"]]
+            yield emit(f"Providers: {' → '.join(active)}")
+
+            _, sheet = _open_sheet(req.spreadsheet_id, req.gid, req.sheet_name)
+            headers   = sheet.row_values(1)
+            email_col = _ensure_col(sheet, headers, "Email_Found")
+            conf_col  = _ensure_col(sheet, headers, "Email_Confidence")
+            src_col   = _ensure_col(sheet, headers, "Email_Source")
+
+            cells = []; found = 0
+            for i, row in enumerate(rows):
+                name   = str(row.get(req.col_name, "") or "").strip()
+                domain = str(row.get(req.col_domain, "") or "").strip()
+                if not name or not domain:
+                    yield emit(f"– [{i+1}] bỏ qua (thiếu name/domain)"); continue
+
+                result = enricher.find(name, domain)
+                row_idx = i + 2
+                if result.email:
+                    found += 1
+                    cells += [
+                        _gs.Cell(row_idx, email_col, result.email),
+                        _gs.Cell(row_idx, conf_col,  result.confidence),
+                        _gs.Cell(row_idx, src_col,   result.source),
+                    ]
+                    yield emit(f"✓ [{i+1}] {name} → {result.email} ({result.confidence}% via {result.source})")
+                else:
+                    yield emit(f"– [{i+1}] {name} @ {domain} → không tìm thấy")
+
+            if cells: sheet.update_cells(cells, value_input_option="RAW")
+            yield emit(f"✓ Hoàn tất: {found}/{len(rows)} emails")
+            yield "data: __EXIT__:0\n\n"
+        except Exception as e:
+            yield emit(f"✗ {e}")
+            yield "data: __EXIT__:1\n\n"
+
+    from fastapi.responses import StreamingResponse as SR
+    return SR(_generate(), media_type="text/event-stream")

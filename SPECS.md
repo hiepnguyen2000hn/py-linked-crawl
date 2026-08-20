@@ -8,7 +8,10 @@
 | **Ngôn ngữ** | Python 3.10+ (một số type hint `X \| None` yêu cầu 3.10; f-string/`TypedDict` dùng 3.11 an toàn hơn) |
 | **Hình thái** | CLI scripts + FastAPI HTTP service (+ Chrome extension phía client) |
 | **Nguồn dữ liệu** | Google Places API, SerpAPI, website công ty, LinkedIn (profile / company jobs) |
-| **AI** | DeepSeek (`deepseek-chat` qua OpenAI-compatible SDK); tuỳ chọn Qwen2.5-3B + LoRA chạy local |
+| **AI** | Đa nhà cung cấp qua `src/providers/ai_providers.py`: DeepSeek · OpenAI · Claude · Gemini · OpenRouter (failover theo thứ tự); tuỳ chọn Qwen2.5-3B + LoRA chạy local |
+| **Làm giàu email** | Hunter.io · Apollo.io · Snov.io · sinh pattern + SMTP probe (waterfall) |
+| **CRM** | HubSpot · Notion (tuỳ chọn, mặc định **tắt**) |
+| **Xác thực HTTP API** | Supabase JWT — ES256 qua JWKS, fallback HS256 shared secret; `REQUIRE_AUTH=false` để tắt khi dev |
 | **Lưu trữ kết quả** | Google Sheets (chính), JSON / Markdown / CSV (phụ) |
 | **Tài liệu tham chiếu** | `README.md`, `LINKEDIN_COOKIES_GUIDE.md`, `CHANGELOG_LINKEDIN_CRAWL.md`, `docs/` |
 
@@ -51,6 +54,18 @@
 5. **Sinh nội dung tiếp cận cá nhân hoá**: connection request message và comment để thả dưới bài viết LinkedIn của lead.
 6. **Ghi ngược tất cả về Google Sheet** — nơi đội sales làm việc hằng ngày.
 
+Từ hai commit `7087e4b` (18/08/2026) và `c932e84` (20/08/2026), pipeline có thêm **ba nhánh tuỳ chọn** và **một tầng cấu hình runtime**:
+
+| Bổ sung | Commit | Ý nghĩa |
+|---|---|---|
+| **Tìm email công việc** của lead (`Email_Found`) | `7087e4b` | Waterfall Hunter → Apollo → Snov → sinh pattern + SMTP probe |
+| **Chấm điểm ICP bằng AI** (`ICP_Score`, `ICP_Tier`…) | `7087e4b` | Chạy **song song** với barem rule-based `score_rule.py`, không thay thế |
+| **Đẩy lead sang CRM** | `7087e4b` | HubSpot / Notion, upsert theo email |
+| **Theo dõi trạng thái lead** (`Lead_Status`) | `7087e4b` | 8 trạng thái từ `cold` → `closed_won`/`closed_lost` |
+| **Xác thực Supabase JWT** cho mọi endpoint | `7087e4b` | Trước đó API mở hoàn toàn |
+| **`ProviderConfig`** — ghi đè provider theo từng request | `c932e84` | Extension gửi kèm API key + thứ tự provider, không phụ thuộc `.env` của server |
+| **OpenRouter cho `PostCommentGenerator`** + siết luật chống văn phong AI | `c932e84` | Xem 11.4 |
+
 ### 1.2. Vấn đề nó giải quyết
 
 | Việc thủ công trước đây | Hệ thống thay thế bằng |
@@ -61,6 +76,9 @@
 | Đọc trang /jobs của công ty xem đang tuyển gì (tín hiệu ngân sách/tăng trưởng) | `linkedin_jobs_fetcher` |
 | Tự chấm điểm lead trong đầu, không nhất quán | `src/score_rule.py` — barem 100 điểm, có lý do |
 | Viết tay connect note & comment cho từng người | `ConnectMessageGenerator`, `PostCommentGenerator` |
+| Tra email công việc của lead bằng tay hoặc mua tool riêng cho từng nguồn | `src/providers/email_providers.py` — waterfall 4 nguồn trong một lời gọi |
+| Copy lead sang HubSpot/Notion bằng tay | `POST /crm/sync` |
+| Bị khoá vào một nhà cung cấp AI duy nhất | `AIRouter` — failover + đổi provider ngay trong request |
 
 ### 1.3. Đối tượng khách hàng mục tiêu (ICP) mà hệ thống được tinh chỉnh cho
 
@@ -101,6 +119,8 @@ flowchart TD
     subgraph ENRICH["④ LÀM GIÀU & CHẤM ĐIỂM"]
         D1["LinkedInEnricher<br/>tìm LinkedIn cá nhân qua SerpAPI"]
         D2["score_rule.score_company<br/>ICP bucket + 0-100 + Tier + 3 lý do"]
+        D3["EmailEnricher (waterfall)<br/>Hunter → Apollo → Snov → pattern"]
+        D4["ICPScorer (AI)<br/>ICP_Score + Tier A-D + suggested_approach"]
     end
 
     subgraph GEN["⑤ SINH NỘI DUNG"]
@@ -111,6 +131,7 @@ flowchart TD
     subgraph OUT["⑥ ĐẦU RA"]
         F1["Google Sheet<br/>(kênh chính)"]
         F2["JSON / Markdown / CSV"]
+        F3["CRM: HubSpot / Notion<br/>(POST /crm/sync)"]
     end
 
     A1 & A2 & A4 --> B1
@@ -120,8 +141,12 @@ flowchart TD
     B3 --> C3
     C2 --> D1
     C1 & C3 & C4 & D1 --> D2
+    A3 --> D3
+    C1 & C3 --> D4
     D2 --> E1 & E2
     E1 & E2 --> F1
+    D3 & D4 --> F1
+    F1 --> F3
     C1 & C2 --> F2
 ```
 
@@ -132,6 +157,8 @@ flowchart TD
 | **CLI batch** | `main.py`, `from_sheet*.py`, `gen_*.py` | Chạy tay trên máy dev, có control đầy đủ, log ra terminal |
 | **HTTP service** | `server.py` (uvicorn, port 3006) | Backend cho UI/n8n; endpoint dài chạy trả về **SSE stream** log realtime |
 | **Browser-extension** | `/linkedin-rows` → extension → `/linkedin-extract` → `/linkedin-write` | Crawl LinkedIn **trong phiên đăng nhập thật của user** — cách né authwall bền nhất |
+
+> **Từ `c932e84`: cấu hình chạy theo request, không theo server.** Các endpoint mới nhận thêm khối `provider_config` (xem 9.7) chứa thứ tự provider + API key. Server **không cần** có sẵn key trong `.env` — mỗi người dùng extension mang key của mình lên. Endpoint cũ (`/enrich-sheet`, `/gen-connect-message`, `/linkedin-sheet`…) vẫn đọc `.env`; riêng `/gen-post-comment` chỉ đọc hai trường `openrouter_api_key` / `openrouter_model` rồi bơm xuống subprocess qua env.
 
 ---
 
@@ -148,6 +175,8 @@ flowchart LR
         EP1["/crawl<br/>/crawl-sheet"]
         EP2["/enrich-sheet<br/>/gen-connect-message<br/>/gen-post-comment<br/>/linkedin-sheet<br/>(SSE)"]
         EP3["/linkedin-rows<br/>/linkedin-extract<br/>/linkedin-write<br/>/auto-write"]
+        EP4["/find-email · /find-email/v2<br/>/score-leads · /lead-status<br/>/providers/status · /providers/test<br/>/crm/sync"]
+        AUTH["require_auth<br/>Supabase JWT (ES256/HS256)"]
         SUB["_make_streaming_response<br/>subprocess + queue + thread"]
     end
 
@@ -164,6 +193,8 @@ flowchart LR
         L2["*_extractor / *_generator<br/>(DeepSeek)"]
         L3["sheets_writer"]
         L4["score_rule"]
+        L5["providers/<br/>ai · email · crm"]
+        L6["email_finder<br/>icp_scorer"]
     end
 
     subgraph EXTSVC["Dịch vụ ngoài"]
@@ -172,16 +203,25 @@ flowchart LR
         X3["Google Places"]
         X4["Google Sheets API"]
         X5["LinkedIn / website"]
+        X6["OpenAI · Claude · Gemini<br/>· OpenRouter"]
+        X7["Hunter · Apollo · Snov<br/>· SMTP/MX"]
+        X8["HubSpot · Notion"]
+        X9["Supabase JWKS"]
     end
 
-    UI --> EP1 & EP2
-    EXT --> EP3
+    UI --> EP1 & EP2 & EP4
+    EXT --> EP3 & EP4
+    AUTH -.gác cổng.-> EP1 & EP2 & EP3 & EP4
+    AUTH --> X9
     EP1 --> SUB --> S5
     EP2 --> SUB --> S1 & S2 & S3 & S4
     EP3 --> L2 & L3
+    EP4 --> L5 & L6 & L3
     S1 & S2 & S3 & S4 & S5 --> LIB
     L1 --> X5
     L2 --> X1
+    L5 --> X1 & X6 & X7 & X8
+    L6 --> X1 & X7
     LIB --> X2 & X3 & X4
 ```
 
@@ -198,6 +238,35 @@ flowchart LR
 - Kết thúc: `data: __EXIT__:<returncode>`
 - Lỗi spawn: `data: __ERROR__:<message>` rồi `__EXIT__:1`
 - Keepalive: nếu 20 giây không có dữ liệu → gửi comment `: keepalive` (chống AWS ALB cắt kết nối idle 60s — commit `ea52f02`)
+
+### 3.2. Xác thực Supabase JWT (`7087e4b`)
+
+Trước `7087e4b`, `server.py` **không có auth**. Từ commit này, **mọi endpoint trừ `/health`** đều gắn `Depends(require_auth)`.
+
+```
+require_auth(Authorization: Bearer <token>)
+  ├─ REQUIRE_AUTH != "true"           → trả {} (dev mode, bỏ qua hoàn toàn)
+  ├─ SUPABASE_JWT_SECRET rỗng         → 500 "SUPABASE_JWT_SECRET not configured"
+  ├─ thiếu header / sai "Bearer "     → 401 "Missing Authorization header"
+  └─ _verify_jwt(token)
+       ├─ 1. JWKS từ <SUPABASE_URL>/auth/v1/.well-known/jwks.json  (cache 10 phút)
+       │      → jose.jwt.decode(algorithms=["ES256","RS256"], audience="authenticated")
+       │      → thất bại thì im lặng rơi xuống bước 2
+       └─ 2. HS256 với SUPABASE_JWT_SECRET (legacy key)
+              → thất bại → 401 "Invalid token: …"
+```
+
+| Biến môi trường | Mặc định | Vai trò |
+|---|---|---|
+| `REQUIRE_AUTH` | `"true"` | `false` → tắt auth toàn cục (chỉ dùng khi dev cục bộ) |
+| `SUPABASE_URL` | rỗng | Dùng để lấy JWKS; rỗng → chỉ còn nhánh HS256 |
+| `SUPABASE_JWT_SECRET` | rỗng | Legacy shared secret. **Bắt buộc phải có kể cả khi dùng JWKS** — `require_auth` chặn trước bằng 500 nếu thiếu |
+
+Ba điểm cần biết khi vận hành:
+
+1. `_JWT_SECRET` và `_REQUIRE_AUTH` đọc **một lần lúc import module** → đổi `.env` phải restart server.
+2. Cấu hình "chỉ JWKS, không có legacy secret" **không chạy được** vì rào 500 ở trên (xem 17.1 B11).
+3. CORS vẫn là `allow_origins=["*"]` — auth chặn được request nặc danh, không chặn được trang web bất kỳ gọi kèm token của user.
 
 ---
 
@@ -223,13 +292,20 @@ flowchart LR
 | `score_rule.py` | Chấm điểm ICP rule-based 100 điểm, không tốn token | thuần Python |
 | `sheets_writer.py` | Toàn bộ I/O Google Sheets: đọc, ghi cột, checkbox, hyperlink runs | `gspread`, `google-auth`, `google-auth-oauthlib` |
 | `output_writer.py` | Ghi JSON / Markdown report ra đĩa | stdlib |
+| `email_finder.py` ⁽ᵐᵒⁱ⁾ | Bản **v1** tìm email: Hunter.io → sinh pattern → SMTP RCPT probe. Chỉ đọc `HUNTER_API_KEY` từ env | `requests`, `dnspython` (tuỳ chọn), `smtplib` |
+| `icp_scorer.py` ⁽ᵐᵒⁱ⁾ | Chấm ICP **bằng AI** qua `AIRouter` → `icp_score` 0-100, tier A/B/C/D, `reasons`, `suggested_approach` | `AIRouter` |
+| `providers/ai_providers.py` ⁽ᵐᵒⁱ⁾ | 5 provider AI + `AIRouter` (failover, task routing, `complete_json`) | `openai`, `anthropic`, `google-generativeai` (import lazy) |
+| `providers/email_providers.py` ⁽ᵐᵒⁱ⁾ | 4 provider email + `EmailEnricher` (waterfall theo ngưỡng confidence) | `requests`, `dnspython`, `smtplib` |
+| `providers/crm_providers.py` ⁽ᵐᵒⁱ⁾ | HubSpot + Notion + `CRMSyncer` (upsert theo email) | `requests` |
+
+⁽ᵐᵒⁱ⁾ thêm ở `7087e4b`. Ba module `providers/*` chỉ được gọi từ `server.py`; **chưa có script CLI nào dùng chúng**.
 
 ### 4.2. Điểm vào — root
 
 | File | Loại | Mô tả ngắn |
 |---|---|---|
 | `main.py` | CLI | Pipeline gốc: search → crawl → (extract) → JSON/Markdown/Sheets |
-| `server.py` | Service | FastAPI, 11 endpoint |
+| `server.py` | Service | FastAPI, **19 endpoint** (11 cũ + 8 mới ở `7087e4b`), mọi endpoint trừ `/health` yêu cầu Supabase JWT |
 | `from_sheet.py` | CLI | Sheet → crawl website → 5 trường profile → ghi lại tab nguồn |
 | `from_sheet_linkedin.py` | CLI | Sheet → crawl LinkedIn profile → 3 bài viết → cột `Bài Viết` + `Đã Crawl` |
 | `from_sheet_linkedin_jobs.py` | CLI | Sheet → crawl LinkedIn `/jobs` → cột `jobs linked` |
@@ -396,6 +472,48 @@ Ngoài ra có `_resolve_linkedin_url()` (HEAD follow redirect, ID số → slug 
 Scope: `https://www.googleapis.com/auth/spreadsheets`.
 `SPREADSHEET_ID` mặc định hardcode `1PW5LnQyXjyl0h16ooufYNYjR1_eb8DgfnCEGLNjsf10` (`sheets_writer.py:35`) — chỉ dùng khi caller không truyền id.
 
+### 5.7. `providers/ai_providers` — `AIRouter`
+
+Năm provider cùng một interface `complete(prompt, temperature, max_tokens) -> AIResponse`:
+
+| `name` | Model mặc định | Transport | Key |
+|---|---|---|---|
+| `deepseek` | `deepseek-chat` | SDK `openai`, base `api.deepseek.com` | `DEEPSEEK_API_KEY` |
+| `openai` | `gpt-4o-mini` | SDK `openai` | `OPENAI_API_KEY` |
+| `claude` | `claude-haiku-4-5-20251001` | SDK `anthropic` | `ANTHROPIC_API_KEY` |
+| `gemini` | `gemini-1.5-flash` | `google.generativeai` | `GEMINI_API_KEY` |
+| `openrouter` | `deepseek/deepseek-chat` | SDK `openai`, base `openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+
+- `AIRouter.from_config(cfg)` dựng danh sách theo `cfg["providers"]` (mặc định `deepseek → openai → claude → gemini`); tên lạ bị bỏ qua; danh sách rỗng → `[DeepSeekProvider()]`.
+- `complete()` **failover tuần tự**: bỏ qua provider `is_configured == False` (thiếu key), gọi provider tiếp theo khi `ok == False`, in `[ai-router] <name> failed — …`. Hết provider → `AIResponse(ok=False, provider="none")`.
+- **Task routing**: `task="complex"` sắp lại ưu tiên `claude → openai → deepseek → gemini`; mặc định `task="bulk"` giữ nguyên thứ tự cấu hình. *(Hiện chưa có lời gọi nào trong repo truyền `task="complex"`.)*
+- `complete_json()` bóc rào ```` ```json ```` rồi `json.loads`; parse lỗi → trả `None` (không raise).
+- `status()` → `[{name, model, configured, priority}]` cho `/providers/status`.
+
+### 5.8. `providers/email_providers` — `EmailEnricher` (waterfall)
+
+| `name` | Cách tìm | `confidence` | Cần |
+|---|---|---|---|
+| `hunter` | `GET /v2/email-finder` | `score` của Hunter (mặc định 50) | `HUNTER_API_KEY` |
+| `apollo` | `POST /v1/people/match` (`reveal_personal_emails=false`) | 90 nếu `email_status == "verified"`, còn lại 60 | `APOLLO_API_KEY` |
+| `snov` | OAuth client-credentials → `POST /v1/get-emails-by-name` | `confidence × 100` | `SNOV_CLIENT_ID` + `SNOV_CLIENT_SECRET` |
+| `pattern` | Sinh 5 mẫu (`first@`, `first.last@`, `firstlast@`, `flast@`, `f.last@`) → kiểm tra MX → SMTP `RCPT TO` 3 mẫu đầu | 60 nếu SMTP nhận (`pattern+smtp`), 20 nếu chỉ đoán | không cần key |
+
+`EmailEnricher.find(full_name, domain)` duyệt provider theo thứ tự, **dừng ở provider đầu tiên** trả email có `confidence >= min_confidence` (mặc định 30 → `pattern` thuần "best guess" 20 điểm **bị loại**, chỉ `pattern+smtp` mới được nhận). Không tìm được → `EMPTY_RESULT` (`email=""`, `source="none"`).
+
+> **Cảnh báo vận hành:** nhánh `pattern` mở kết nối SMTP cổng 25 tới MX của khách hàng. Nhiều nhà cung cấp cloud chặn cổng 25 outbound, và RCPT probe hàng loạt dễ bị xếp vào hành vi dò tìm địa chỉ → xem 17.3.
+
+### 5.9. `providers/crm_providers` — `CRMSyncer`
+
+| Provider | Upsert theo | Trường ghi |
+|---|---|---|
+| `hubspot` | `POST /crm/v3/objects/contacts/search` theo `email` → PATCH hoặc POST | `firstname`, `lastname`, `email`, `jobtitle`, `company`, `hs_lead_status`, `linkedin_bio`, `description` (chứa `ICP Score` + note) |
+| `notion` | Query database filter `Email == …` → PATCH page hoặc POST page mới | `Name`, `Email`, `Title`, `Company`, `Status`, `ICP Score`, `ICP Tier`, `LinkedIn`, `Notes` (cắt 2000 ký tự) |
+
+- `CRMSyncer.__init__` **lọc bỏ provider chưa cấu hình**; `from_config` mặc định `providers: []` → không có CRM nào chạy nếu extension không khai báo.
+- Notion yêu cầu database đã có sẵn đúng 9 property với đúng kiểu (`title`, `email`, `rich_text`, `select`, `number`, `url`) — sai kiểu là lỗi 400 cho từng contact.
+- `SyncResult` gom `created` / `updated` / `errors[]`; lỗi từng contact không dừng vòng lặp.
+
 ---
 
 ## 6. Các luồng nghiệp vụ end-to-end
@@ -554,11 +672,41 @@ flowchart TD
 - `response_deepseek/deepseek_<timestamp>_result.json`
 - In ra terminal dạng khung có phân mục Leadership / Contact / Social / Services.
 
+### Flow 6 — Làm giàu email, chấm điểm AI & đẩy CRM (`7087e4b`, chỉ qua HTTP)
+
+Luồng này **không có script CLI**, chỉ gọi được qua `server.py` (thường là từ Chrome extension, kèm `provider_config`).
+
+```
+POST /find-email/v2 ─┐
+                     ├─ read_from_sheet → EmailEnricher.find(name, domain) từng dòng
+                     └─ ghi Email_Found | Email_Confidence | Email_Source   (SSE từng dòng)
+
+POST /score-leads  ──┐
+                     ├─ read_from_sheet → lọc dòng đã có ICP_Score (trừ khi regen=true)
+                     ├─ AIRouter (từ provider_config) → ICPScorer.score_lead()
+                     └─ ghi ICP_Score | ICP_Tier | ICP_Priority | ICP_Reason | ICP_Approach
+
+POST /lead-status ───→ đọc toàn bộ lead + đếm theo trạng thái  (JSON, không SSE)
+POST /lead-status/update → ghi Lead_Status | Lead_Note cho các dòng chỉ định
+
+POST /crm/sync ──────┐
+                     ├─ read_from_sheet → map sang CRMContact
+                     └─ CRMSyncer.sync() → HubSpot/Notion  (SSE tổng kết từng provider)
+```
+
+Thứ tự khuyến nghị: `/enrich-sheet` (làm giàu công ty) → `/score-leads` → lọc Tier A/B → `/find-email/v2` → `/crm/sync`. Đặt `/find-email/v2` **sau** bước chấm điểm để không tốn credit Hunter/Apollo cho lead Tier C/D.
+
+Ba khác biệt so với các flow cũ cần nhớ:
+
+1. **Ghi Sheet theo từng dòng** (`/score-leads` gọi `update_cells` mỗi lead) thay vì gom batch → tốn quota Sheets, xem 17.3.
+2. **Không có cột checkbox đánh dấu**; cơ chế skip duy nhất là "ô `ICP_Score` đã có giá trị". `/find-email/v2` **không skip gì cả** — chạy lại là tìm lại từ đầu và ghi đè.
+3. **Cột tự sinh bằng `_ensure_col`**: header chưa có thì ghi vào ô `(1, số_header_khác_rỗng + 1)`.
+
 ---
 
 ## 7. Đặc tả HTTP API (`server.py`)
 
-**Base**: `http://<host>:3006` · **CORS**: `allow_origins=["*"]`, mọi method/header · **Không có authentication**.
+**Base**: `http://<host>:3006` · **CORS**: `allow_origins=["*"]`, mọi method/header · **Auth**: Supabase JWT bắt buộc trên mọi endpoint trừ `/health` (`Authorization: Bearer <token>`, xem 3.2; đặt `REQUIRE_AUTH=false` để tắt khi dev).
 
 Khởi chạy: `python -m uvicorn server:app --port 3006 --reload`
 
@@ -577,6 +725,16 @@ Khởi chạy: `python -m uvicorn server:app --port 3006 --reload`
 | POST | `/linkedin-extract` | JSON | HTML → markdown → trích 3 bài viết |
 | POST | `/linkedin-write` | JSON | Ghi kết quả bài viết về Sheet |
 | POST | `/auto-write` | JSON | Ghi cột trạng thái tuỳ ý về Sheet |
+| POST | `/find-email` | **SSE** | Tìm email — bản v1 (`src/email_finder.py`, chỉ Hunter + pattern, key lấy từ `.env`) |
+| POST | `/find-email/v2` | **SSE** | Tìm email — waterfall đa provider, nhận `provider_config` |
+| POST | `/score-leads` | **SSE** | Chấm ICP bằng AI → 5 cột `ICP_*` |
+| POST | `/lead-status` | JSON | Đọc toàn bộ lead + tổng hợp theo trạng thái |
+| POST | `/lead-status/update` | JSON | Ghi `Lead_Status` / `Lead_Note` |
+| POST | `/providers/status` | JSON | Provider nào đã cấu hình, thứ tự ưu tiên |
+| POST | `/providers/test` | JSON | Test kết nối **một** provider cụ thể |
+| POST | `/crm/sync` | **SSE** | Đẩy lead sang HubSpot / Notion |
+
+> Tám endpoint dưới thêm ở `7087e4b`. SSE của chúng **tự sinh trong process server** (không qua `_make_streaming_response`/subprocess) nên **không có keepalive 20 giây** — job dài chạy sau reverse proxy có idle timeout ngắn vẫn có thể bị cắt.
 
 ### 7.2. Chi tiết
 
@@ -669,6 +827,122 @@ Chỉ đụng đúng những hàng gửi lên (tránh xoá trắng hàng cũ —
             {"index":1, "col_header":"Message_Sent",   "col_value":"TRUE"}]}
 ```
 Gom theo `col_header` rồi `update_cells` từng nhóm. Dùng sau khi extension thực hiện auto-connect / auto-message.
+
+#### `POST /find-email` (v1) · `POST /find-email/v2`
+
+```jsonc
+// v1 — src/email_finder.py, chỉ HUNTER_API_KEY từ .env
+{"spreadsheet_id":"...", "gid":0, "limit":50,
+ "col_name":"fullName", "col_domain":"domain"}
+
+// v2 — waterfall đa provider, key đi kèm request
+{"spreadsheet_id":"...", "gid":0, "limit":50,
+ "col_name":"fullName", "col_domain":"domain",
+ "provider_config":{
+   "email_providers":["hunter","apollo","snov","pattern"],
+   "hunter_api_key":"...", "apollo_api_key":"...",
+   "snov_client_id":"...", "snov_client_secret":"..."}}
+```
+
+Cả hai trả **SSE** (`data: <log>`, kết `data: __EXIT__:0|1`). Khác nhau:
+
+| | v1 | v2 |
+|---|---|---|
+| Engine | `find_emails_batch()` | `EmailEnricher` |
+| Nguồn | Hunter → pattern → SMTP | Hunter → Apollo → Snov → pattern |
+| Nguồn key | `.env` của server | `provider_config` (để rỗng thì fallback về env) |
+| Ngưỡng nhận | không có (ghi cả best-guess 20%) | `min_confidence = 30` |
+| Cột ghi | `Email_Found`, `Email_Confidence` | + `Email_Source` |
+
+> Hai bản **cùng tồn tại**, logic trùng nhau khoảng 80%. v1 là bản đầu, v2 là bản thay thế nhưng endpoint cũ chưa bị gỡ — xem 17.2.
+
+#### `POST /score-leads`
+
+```jsonc
+{"spreadsheet_id":"...", "gid":0, "limit":100, "regen":false,
+ "col_name":"fullName", "col_title":"title", "col_company":"company",
+ "col_industry":"industry", "col_post":"Bài Viết",
+ "provider_config":{"ai_providers":["deepseek","openai"], "deepseek_api_key":"..."}}
+```
+
+- Bỏ qua dòng đã có `ICP_Score` trừ khi `regen=true`; không còn dòng nào → phát `✓ Tất cả đã có điểm…` rồi `__EXIT__:0`.
+- Đọc thêm hai cột **cố định, không cấu hình được**: `about` và `companySize`.
+- Ghi 5 cột `ICP_Score`, `ICP_Tier`, `ICP_Priority`, `ICP_Reason`, `ICP_Approach` — **mỗi lead một lần `update_cells`**.
+- Mỗi lead phát một dòng SSE: `[3/40] Sarah Tan → 88/100 Tier A | C-level fintech SG, đang tuyển data…`
+
+#### `POST /lead-status` · `POST /lead-status/update`
+
+```jsonc
+// /lead-status  →
+{"ok":true, "total":240,
+ "leads":[{"index":0,"name":"Sarah Tan","company":"FinPay","title":"CTO",
+           "status":"cold","icp_score":"88","icp_tier":"A","note":"","email":"sarah@finpay.sg"}],
+ "summary":{"cold":210, "contacted":25, "replied":5}}
+
+// /lead-status/update
+{"spreadsheet_id":"...", "gid":0,
+ "updates":[{"index":0, "status":"contacted", "note":"Đã gửi connect 20/08"}]}
+```
+
+Tám trạng thái hợp lệ (`VALID_STATUSES`): `cold` · `contacted` · `replied` · `meeting` · `proposal` · `closed_won` · `closed_lost` · `nurturing`.
+**Lưu ý:** hằng số này **không được kiểm tra ở đâu cả** — `/lead-status/update` ghi thẳng chuỗi client gửi lên (xem 17.1 B10). `note` rỗng thì không ghi đè note cũ.
+
+#### `POST /providers/status`
+
+Body là **chính khối `ProviderConfig`** (không bọc trong `provider_config`):
+
+```jsonc
+{"email_providers":["hunter","pattern"], "hunter_api_key":"...",
+ "ai_providers":["deepseek","claude"], "deepseek_api_key":"...",
+ "crm_providers":["notion"], "notion_token":"...", "notion_database_id":"..."}
+```
+```jsonc
+{"ok":true,
+ "email":[{"name":"hunter","configured":true,"priority":1},
+          {"name":"pattern","configured":true,"priority":2}],
+ "ai":   [{"name":"deepseek","model":"deepseek-chat","configured":true,"priority":1},
+          {"name":"claude","model":"claude-haiku-4-5-20251001","configured":false,"priority":2}],
+ "crm":  [{"name":"notion","configured":true}]}
+```
+Chỉ kiểm tra **có key hay không**, không gọi mạng. Danh sách `crm` chỉ chứa provider đã cấu hình (`CRMSyncer` lọc sẵn trong `__init__`).
+
+#### `POST /providers/test`
+
+```jsonc
+{"provider":"hunter", "cfg":{"hunter_api_key":"..."}}   →   {"ok":true, "message":"Kết nối OK — 128/500 searches đã dùng"}
+```
+
+| `provider` | Phép thử thật sự |
+|---|---|
+| `hunter` | `GET /v2/account` → báo cả hạn mức đã dùng |
+| `apollo` | `GET /v1/auth/health` |
+| `snov` | Lấy OAuth token |
+| `pattern` | Luôn `ok:true` (không cần key) |
+| `deepseek` · `openai` · `claude` · `gemini` · `openrouter` | Gọi thật prompt `"Say OK"` với `max_tokens=5` — **tốn token** |
+| `hubspot` | `GET /crm/v3/objects/contacts?limit=1` |
+| `notion` | `GET /databases/<id>` → trả kèm tên database |
+
+Provider lạ → `{"ok":false, "message":"Unknown provider: <x>"}` (HTTP vẫn 200).
+
+#### `POST /crm/sync`
+
+```jsonc
+{"spreadsheet_id":"...", "gid":0, "limit":200,
+ "provider_config":{"crm_providers":["hubspot","notion"],
+                    "hubspot_api_key":"...", "notion_token":"...", "notion_database_id":"..."}}
+```
+
+Ánh xạ cột Sheet → `CRMContact`:
+
+| `CRMContact` | Lấy từ cột |
+|---|---|
+| `name` / `title` / `company` | `fullName` / `title` / `company` |
+| `email` | `Email_Found`, rỗng thì `email` |
+| `linkedin_url` | `linkedUrl` |
+| `status` | `Lead_Status` (mặc định `cold`) |
+| `icp_score` / `icp_tier` / `notes` | `ICP_Score` / `ICP_Tier` / `ICP_Reason` |
+
+Không có CRM nào được cấu hình → `⚠ Không có CRM provider nào được cấu hình` + `__EXIT__:1`. **Đẩy toàn bộ dòng đọc được**, không lọc theo Tier và không có cột đánh dấu "đã sync" → chạy lại là gọi lại API cho mọi dòng.
 
 ---
 
@@ -806,6 +1080,44 @@ company_emails, company_phones, linkedin_company, facebook, twitter, youtube,
 other_socials, services, summary
 ```
 
+### 9.7. `ProviderConfig` (`c932e84`) — khối cấu hình gửi theo request
+
+```jsonc
+{
+  // ── Email ──────────────────────────────────────────────
+  "email_providers":    ["hunter", "apollo", "snov", "pattern"],  // thứ tự waterfall
+  "hunter_api_key":     "", "apollo_api_key": "",
+  "snov_client_id":     "", "snov_client_secret": "",
+
+  // ── AI ─────────────────────────────────────────────────
+  "ai_providers":       ["deepseek", "openai", "claude", "gemini"],  // thứ tự failover
+  "deepseek_api_key":   "", "openai_api_key": "", "claude_api_key": "",
+  "gemini_api_key":     "", "openrouter_api_key": "",
+  "openai_model":       "", "claude_model": "", "openrouter_model": "",
+
+  // ── CRM ────────────────────────────────────────────────
+  "crm_providers":      [],          // mặc định RỖNG — không sync CRM
+  "hubspot_api_key":    "",
+  "notion_token":       "", "notion_database_id": ""
+}
+```
+
+- Mọi trường đều **có mặc định** → client gửi `{}` vẫn hợp lệ; khi đó provider tự đọc key từ `.env` của server (constructor có dạng `api_key or os.getenv(...)`).
+- Endpoint nhận: `/find-email/v2`, `/score-leads`, `/crm/sync`, `/gen-post-comment` (bọc trong `provider_config`); `/providers/status` nhận **trực tiếp** ở gốc body; `/providers/test` bọc trong `cfg`.
+- Ba hàm dựng đối tượng: `_build_email_enricher`, `_build_ai_router`, `_build_crm_syncer` (`server.py:975-1010`).
+- `/gen-post-comment` là ngoại lệ: chỉ dùng `openrouter_api_key` + `openrouter_model`, đổ xuống subprocess qua env `OPENROUTER_API_KEY` / `OPENROUTER_MODEL`; **mọi trường khác bị bỏ qua**. Model mặc định khi để rỗng: `poolside/laguna-s-2.1:free`.
+
+### 9.8. Data class của tầng provider
+
+| Kiểu | Trường | Nơi dùng |
+|---|---|---|
+| `AIResponse` | `content`, `provider`, `model`, `ok`, `error` | `ai_providers` |
+| `EmailResult` | `email`, `confidence` (0-100), `source`, `alternatives[]`, `verified` | `email_providers` |
+| `CRMContact` | `name`, `email`, `title`, `company`, `linkedin_url`, `status`, `icp_score`, `icp_tier`, `notes`, `source_row`, `extra{}` | `crm_providers` |
+| `SyncResult` | `provider`, `ok`, `created`, `updated`, `skipped`, `errors[]` | `crm_providers` |
+
+Kết quả của `email_finder.find_email()` (bản v1) **không** dùng `EmailResult` mà là dict thuần `{email, confidence, source, alternatives}` với `source ∈ {hunter, smtp, pattern, none}`.
+
 ---
 
 ## 10. Hệ thống chấm điểm ICP (barem 100 điểm)
@@ -875,11 +1187,31 @@ total = clamp(raw + bonus − penalty, 0, 100)
 
 Sắp 8 hạng mục theo điểm giảm dần, lấy ghi chú của 3 hạng mục cao nhất — cho sales biết **vì sao** lead này được điểm đó (ví dụ: `"Primary market: Singapore (SG/HK)"`, `"C/VP tech: chief technology officer"`).
 
+### 10.6. Hai hệ chấm điểm song song (từ `7087e4b`)
+
+Repo hiện có **hai bộ chấm ICP độc lập, ghi vào hai bộ cột khác nhau, không đối chiếu nhau**:
+
+| | `src/score_rule.py` (cũ) | `src/icp_scorer.py` (mới) |
+|---|---|---|
+| Cách chấm | Rule-based, thuần Python | Gọi AI qua `AIRouter`, `temperature=0.2`, `max_tokens=600` |
+| Chi phí | **0 token** | 1 lượt gọi AI / lead |
+| Hạng mục | 8 (A-H) + bonus/penalty | 5: seniority 30 · industry 25 · size 20 · LinkedIn activity 15 · buying signals 10 |
+| Định nghĩa ICP | ICP-A / ICP-B hardcode trong code | `DEFAULT_ICP_CONFIG` (ngành / chức danh / quy mô / buying signal) — truyền được `icp_config` khi khởi tạo, nhưng **`server.py` chưa mở tham số này ra API** |
+| Ngưỡng | HOT ≥ 80 · WARM · COLD · DROP | A ≥ 75 · B 50-74 · C 30-49 · D < 30 |
+| Cột ghi | `ICP_Bucket`, `Score_Total`, `Tier`, `Reason_1..3` | `ICP_Score`, `ICP_Tier`, `ICP_Priority`, `ICP_Reason`, `ICP_Approach` |
+| Gọi từ | `from_sheet_full_enrich.py` (CLI + `/enrich-sheet`) | `/score-leads` |
+| Tái lập được | Có — cùng dữ liệu luôn ra cùng điểm | Không hoàn toàn — AI có thể lệch giữa hai lần chạy |
+| Khi lỗi | Không bao giờ lỗi | `ok:false` → ghi 0 điểm, Tier `D`, Priority `Low` |
+
+**Hệ quả thực tế:** một dòng có thể vừa `Tier = HOT` (rule) vừa `ICP_Tier = C` (AI), vì hai barem đo hai thứ khác nhau — barem cũ nặng về **công ty** (địa lý, quy mô, ngành, tín hiệu AI/DX), barem mới nặng về **con người** (riêng seniority đã 30 điểm) và mức độ hoạt động LinkedIn. Chọn một hệ làm chuẩn để lọc, hệ còn lại chỉ tham khảo; đừng cộng gộp.
+
 ---
 
 ## 11. Prompt engineering — toàn bộ prompt DeepSeek
 
 Cấu hình chung: `model="deepseek-chat"`, `base_url="https://api.deepseek.com"`, gọi qua SDK `openai`.
+
+> **Từ `7087e4b` / `c932e84`** cấu hình này không còn đúng với mọi module: `ICPScorer` đi qua `AIRouter` (provider nào cũng được), còn `PostCommentGenerator` **ưu tiên OpenRouter** nếu có `OPENROUTER_API_KEY`, chỉ rơi về DeepSeek khi không có. Các extractor còn lại vẫn gọi thẳng DeepSeek.
 
 | Module | Temp | max_tokens | Cắt input | Kiểu trả về |
 |---|---|---|---|---|
@@ -889,6 +1221,7 @@ Cấu hình chung: `model="deepseek-chat"`, `base_url="https://api.deepseek.com"
 | `linkedin_jobs_fetcher` | 0 | 512 | 8 000 ký tự | JSON `{"jobs":[…]}` |
 | `ConnectMessageGenerator` | **0.7** | 150 | bio 200 / post 300 | Chuỗi thuần |
 | `PostCommentGenerator` | **0.7** | 150 | post 2 000 | Chuỗi thuần |
+| `ICPScorer` ⁽ᵐᵒⁱ⁾ | 0.2 | 600 | post 500 / about 300 | JSON object 7 key |
 | `analyze_companies.py` | 0 | 2048 | 6 000 ký tự | JSON object 4 key |
 
 ### 11.1. `CompanyProfileExtractor` — 5 trường profile
@@ -941,6 +1274,46 @@ Persona: *senior Business Development Executive 10+ năm kinh nghiệm*. Đầy 
 - **Đầu ra**: 2–3 câu, 30–60 từ, luôn bằng **tiếng Anh** kể cả khi bài viết là ngôn ngữ khác.
 - **Edge case**: bài rỗng/không có nội dung đáng phản hồi → trả đúng chuỗi `NO_COMMENT_GENERATED`, generator quy về `""`.
 
+**Cập nhật ở `c932e84` — khối `HUMANIZATION` được viết lại để comment bớt "mùi AI".**
+Bản cũ chỉ có 3 gạch đầu dòng chung chung ("thêm vài chỗ chưa hoàn hảo tự nhiên", "đừng lặp filler quá một lần"). Bản mới là **danh sách cấm cụ thể**, đọc là kiểm chứng được khi review:
+
+| Nhóm luật | Nội dung |
+|---|---|
+| Dấu câu | Cấm em dash `—` / en dash `–` → thay bằng dấu phẩy hoặc chấm |
+| Từ vựng | Cấm 13 từ đặc trưng văn phong LLM: *vibrant, crucial, pivotal, highlight, underscore, delve, tapestry, landscape, testament, showcase, foster, enhance, key* (tính từ) |
+| Cấu trúc | Cấm liệt kê bộ ba ("X, Y, and Z"); cấm in đậm; cấm emoji |
+| Mở đầu | Cấm *"Great post"*, *"Thanks for sharing"*, *"This resonates"*, *"Honestly?"*, *"Here's the thing"*, *"Let's be real"* |
+| Dẫn dắt | Cấm *"Let me"*, *"I want to"*, *"I'd like to"*; cấm hook giả-thân-mật và ngắt nhịp kịch tính trước khi vào ý |
+| Nịnh | Cấm *"Absolutely"*, *"Certainly"*, *"Of course"* |
+| Nhịp câu | Bắt buộc dài ngắn xen kẽ, không đều đều tầm trung; một câu ngắn nhấn mạnh thì được, xếp liên tiếp nhiều mẩu ngắn thì không |
+| Động từ | Dùng *is/are/has* thay cho *serves as / stands as / boasts* |
+
+Bản chép đầy đủ ở `docs/prompt_post_comment.md` **chưa được cập nhật theo `c932e84`** — đọc thẳng `src/post_comment_generator.py` mới là bản đúng.
+
+**Chọn model (`c932e84`):** `PostCommentGenerator.__init__` không còn bắt buộc `DEEPSEEK_API_KEY`.
+
+```
+có OPENROUTER_API_KEY và không truyền base_url
+   → OpenRouter, model = OPENROUTER_MODEL (mặc định "poolside/laguna-s-2.1:free")
+ngược lại
+   → DeepSeek, model = "deepseek-chat"
+       thiếu cả hai key → ValueError
+       "No AI key found. Set OPENROUTER_API_KEY or DEEPSEEK_API_KEY in .env"
+```
+
+Mỗi lần khởi tạo in một dòng `[PostCommentGenerator] using <OpenRouter|DeepSeek> model: <model>` — cách nhanh nhất để biết log SSE đang chạy bằng model nào.
+
+### 11.5. `ICPScorer` — prompt chấm điểm
+
+Prompt tiếng Việt, nhồi `DEFAULT_ICP_CONFIG` vào phần đầu (8 ngành + 8 chức danh + dải quy mô + 8 buying signal), rồi 7 trường lead (`name`, `title`, `company`, `industry`, `company_size`, `recent_post` cắt 500 ký tự, `about` cắt 300 ký tự).
+
+Barem trong prompt ghi rõ khung điểm cho từng mức, ví dụ *seniority*: C-level/Founder 28-30 · Director/VP 22-27 · Manager 12-18 · Individual 0-8.
+
+JSON trả về 7 key: `icp_score`, `tier`, `priority`, `score_breakdown{5 hạng mục}`, `reasons`, `suggested_approach`.
+Parse qua `AIRouter.complete_json()`; parse lỗi hoặc router chết → `{"icp_score":0, "tier":"D", "priority":"Low", "ok":false, "error":…}` kèm log `[icp-scorer] Error for <tên>: …`.
+
+> `score_breakdown` **được AI trả về nhưng không ghi vào Sheet** — muốn kiểm chứng vì sao một lead được 88 điểm thì chỉ còn cột `ICP_Reason` (1-2 câu).
+
 ---
 
 ## 12. Cấu hình, xác thực & biến môi trường
@@ -952,8 +1325,29 @@ Persona: *senior Business Development Executive 10+ năm kinh nghiệm*. Đầy 
 GOOGLE_PLACES_API_KEY=...     # bắt buộc khi --source google
 SERPAPI_KEY=...               # bắt buộc khi --source serpapi hoặc --enrich-linkedin
 
-# AI
+# AI — DeepSeek là mặc định; provider dưới chỉ cần khi đổi thứ tự trong ProviderConfig
 DEEPSEEK_API_KEY=sk-...       # bắt buộc cho gần như mọi luồng AI
+OPENROUTER_API_KEY=sk-or-...  # nếu có → PostCommentGenerator ưu tiên dùng (c932e84)
+OPENROUTER_MODEL=...          # mặc định "poolside/laguna-s-2.1:free"
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...  # provider "claude"
+GEMINI_API_KEY=...
+
+# Tìm email (7087e4b) — không có key nào thì vẫn chạy được nhánh pattern+SMTP
+HUNTER_API_KEY=...
+APOLLO_API_KEY=...
+SNOV_CLIENT_ID=...
+SNOV_CLIENT_SECRET=...
+
+# CRM (7087e4b) — tuỳ chọn, mặc định không sync
+HUBSPOT_API_KEY=...
+NOTION_TOKEN=secret_...
+NOTION_DATABASE_ID=...
+
+# Xác thực API (7087e4b) — xem 3.2
+REQUIRE_AUTH=true             # false = tắt auth, chỉ dùng khi dev cục bộ
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_JWT_SECRET=...       # bắt buộc khi REQUIRE_AUTH=true, kể cả khi đã có JWKS
 
 # Google Sheets — chọn 1 trong 2
 GOOGLE_SERVICE_ACCOUNT_JSON=path/to/service_account.json   # khuyến nghị (server/headless)
@@ -979,6 +1373,15 @@ LINKEDIN_COOKIES_JSON=[{"name":"li_at","value":"...","domain":".linkedin.com"}]
 | `gen_connect_message.py` / `gen_post_comment.py` | | | ✅ | ✅ | |
 | `/crawl`, `/linkedin-extract` | | | ✅ | | |
 | `/crawl-sheet`, `/linkedin-rows/write`, `/auto-write` | | | | ✅ (service account) | |
+| `/find-email` (v1) | | | | ✅ | | Hunter tuỳ chọn — không có key thì rơi về pattern+SMTP |
+| `/find-email/v2` | | | | ✅ | | Hunter / Apollo / Snov — tuỳ chọn, gửi qua `provider_config` |
+| `/score-leads` | | | ✅² | ✅ | | |
+| `/lead-status`, `/lead-status/update` | | | | ✅ | | |
+| `/crm/sync` | | | | ✅ | | HubSpot token, hoặc Notion token + database id |
+| `/providers/status` | | | | | | Không cần gì — chỉ đọc cấu hình |
+| **Mọi endpoint trừ `/health`** | | | | | | **+ Supabase JWT** (`SUPABASE_JWT_SECRET`, `SUPABASE_URL`) |
+
+² Hoặc bất kỳ provider AI nào khác khai báo trong `ai_providers`.
 
 ¹ Script bắt buộc phải có `DEEPSEEK_API_KEY` mới chạy, dù luồng chính "zero token" chỉ dùng DeepSeek khi parse trực tiếp thất bại.
 
@@ -998,7 +1401,11 @@ playwright install chromium          # bắt buộc — mọi luồng crawl đ�
 cp .env.example .env                 # rồi điền key
 ```
 
-`requirements.txt`: requests, beautifulsoup4, tenacity, python-dotenv, lxml, google-search-results, playwright, crawl4ai, openai, gspread, google-auth, fastapi, uvicorn[standard], python-multipart.
+`requirements.txt`: requests, **python-jose[cryptography]**, **dnspython**, beautifulsoup4, tenacity, python-dotenv, lxml, google-search-results, playwright, crawl4ai, openai, gspread, google-auth, fastapi, uvicorn[standard], python-multipart.
+
+> `python-jose` (verify JWT) và `dnspython` (tra MX khi sinh pattern email) được thêm ở `7087e4b`.
+> **Chưa có trong requirements**: `anthropic` (provider `claude`) và `google-generativeai` (provider `gemini`) — hai provider này import lazy nên chỉ chết lúc gọi, trả `AIResponse(ok=False)` rồi router lặng lẽ failover sang provider kế tiếp. Muốn dùng thật phải `pip install anthropic google-generativeai`.
+> `.env.example` mới chỉ có 4 dòng (`GOOGLE_PLACES_API_KEY`, `SERPAPI_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`) — thiếu toàn bộ biến Supabase / email / CRM ở trên.
 
 > `google-auth-oauthlib` được `sheets_writer.py` import nhưng **không có trong `requirements.txt`** (thường được kéo theo gián tiếp). `torch/transformers/peft` cho `IEExtractor` đã bị gỡ khỏi requirements ở commit `a4b7231`.
 
@@ -1137,6 +1544,12 @@ Công cụ kiểm thử thủ công: `test_extract_posts.py <file.html>` — ch�
 | B4 | `from_sheet_linkedin_jobs.py:39` | Flag `--col-jobs` chỉ dùng để **đọc** giá trị cũ; lúc ghi luôn dùng hằng `JOBS_HEADER = "jobs linked"` → cấu hình của user bị bỏ qua (README ghi mặc định là `tuyển d`). | 🟡 Thấp |
 | B5 | `from_sheet_full_enrich.py:71-73, 158` | `_is_done()` đọc header `"Đã Crawl"` nhưng log và README nói `"Đã Enrich"` → nếu sheet dùng tên cột theo tài liệu thì cơ chế skip **không hoạt động** (mọi hàng bị crawl lại). | 🟠 Trung bình |
 | B6 | `src/linkedin_jobs_fetcher.py:126-131` | Gọi `generate_markdown(cleaned_html=…, html2text_options=…)`; ở `server.py:346-352` cùng API lại gọi bằng `input_html=…`. Một trong hai chữ ký sai với phiên bản crawl4ai đang dùng → rơi vào nhánh fallback BeautifulSoup âm thầm. | 🟡 Thấp |
+| B7 | `src/providers/crm_providers.py:159-166` | Notion: lead **không có email** thì query gửi body rỗng `{}` → API trả **toàn bộ page trong database** → `existing[0]` luôn tồn tại → contact đó **ghi đè lên page đầu tiên của database**. Nhiều lead thiếu email = tất cả cùng ghi đè lên một page. | 🔴 Cao (mất dữ liệu) |
+| B8 | `email_finder.py:143` · `providers/email_providers.py:51` | `domain.lstrip("www.")` bào **từng ký tự** thuộc tập `{w, .}` chứ không cắt tiền tố: `wework.com` → `ework.com`, `wise.com` → `ise.com`. Mọi domain bắt đầu bằng `w` đều tra sai. | 🟠 Trung bình |
+| B9 | `email_finder.py:32-36` · `providers/email_providers.py:46-48` | `_split_name()` mặc định họ đứng đầu (quy ước tiếng Việt): `"Sarah Tan"` → `first="tan"`, `last="sarah"` → gửi ngược tên/họ cho Hunter/Apollo/Snov và sinh pattern sai. Trong khi ICP của hệ thống lại là **Singapore / Hong Kong**. | 🔴 Cao |
+| B10 | `server.py:889` | `VALID_STATUSES` (8 trạng thái) được khai báo nhưng **không dùng ở đâu**; `/lead-status/update` ghi thẳng chuỗi client gửi lên → `Lead_Status` có thể chứa giá trị lạ, làm hỏng `summary` của `/lead-status` và trường `status` khi sync CRM. | 🟡 Thấp |
+| B11 | `server.py:85-100` | `require_auth` chặn bằng 500 khi thiếu `SUPABASE_JWT_SECRET`, **trước cả khi thử JWKS** → cấu hình "chỉ dùng ES256/JWKS" không chạy được, buộc phải giữ legacy secret. | 🟠 Trung bình |
+| B12 | `src/providers/ai_providers.py:243-247` | `complete_json()` bóc code fence bằng `raw.split("```")[1]`; JSON có chứa ba backtick bên trong chuỗi thì cắt sai → `json.loads` lỗi → trả `None` → `ICPScorer` ghi 0 điểm/Tier D cho lead đó mà log chỉ báo "No JSON response". | 🟡 Thấp |
 
 ### 17.2. Lệch giữa tài liệu và code
 
@@ -1148,12 +1561,25 @@ Công cụ kiểm thử thủ công: `test_extract_posts.py <file.html>` — ch�
 | `server.py:194` docstring: ghi cột `Connect_Message` | `gen_connect_message.py:23` ghi cột `connectMsg` |
 | README: `from_sheet_full_enrich.py` ghi cột `Đã Enrich` | Code ghi `Đã Crawl` |
 | README: `from_sheet.py` ghi vào tab `Enriched` (`--output-sheet`) | Code ghi đè **tab nguồn**, không có flag `--output-sheet` |
+| `server.py:1012` comment `── GET /providers/status ──` | Endpoint thật là **POST** (bắt buộc, vì body chứa `ProviderConfig`) |
+| `server.py:1145` comment "Override endpoint cũ để dùng EmailEnricher" | Không override gì cả — `/find-email` (v1) **vẫn còn nguyên** và vẫn dùng `src/email_finder.py`. Hai bản logic chạy song song |
+| `src/email_finder.py` docstring: "Ghi kết quả vào sheet cột Email_Found, Email_Confidence" | Module không đụng Sheet — việc ghi nằm ở `server.py` |
+| `docs/prompt_post_comment.md` (bản chép prompt) | Chưa cập nhật khối `HUMANIZATION` viết lại ở `c932e84` |
+| `.env.example` (4 dòng) | Code đọc thêm khoảng 15 biến: Supabase, Hunter/Apollo/Snov, HubSpot/Notion, OpenAI/Anthropic/Gemini |
+| `README.md` liệt kê 11 endpoint | `server.py` hiện có 19 |
 
 ### 17.3. Rủi ro vận hành & bảo mật
 
 | Rủi ro | Chi tiết | Giảm thiểu gợi ý |
 |---|---|---|
-| **API không xác thực** | `server.py` mở CORS `*`, không có auth. Ai gọi được endpoint là đọc/ghi được Google Sheet của bạn. | Thêm API key header / reverse proxy có auth / chỉ bind localhost |
+| ~~**API không xác thực**~~ → **CORS vẫn mở** | Đã có Supabase JWT từ `7087e4b`, nhưng `allow_origins=["*"]` giữ nguyên: trang web bất kỳ vẫn gọi được API nếu lấy được token của user. `REQUIRE_AUTH=false` tắt sạch auth và **không có cảnh báo nào trong log**. | Siết `allow_origins` về domain extension/UI; log rõ khi chạy ở chế độ `REQUIRE_AUTH=false` |
+| **API key của người dùng đi trong body request** | `ProviderConfig` mang Hunter/Apollo/Snov/OpenAI/Claude/HubSpot/Notion key lên server mỗi request. Không có TLS là lộ hết; access log của reverse proxy có thể ghi lại body. | Bắt buộc HTTPS; cấm log body; cân nhắc lưu key phía server theo user thay vì gửi mỗi lần |
+| **Key rơi vào env của subprocess** | `/gen-post-comment` bơm `OPENROUTER_API_KEY` vào environment tiến trình con — cùng dạng rủi ro với `LINKEDIN_COOKIES_JSON` ở dòng dưới | Truyền qua stdin hoặc file tạm quyền 600 |
+| **SMTP RCPT probe** | Nhánh `pattern` mở kết nối cổng 25 tới MX của công ty khách và thử `RCPT TO` tối đa 3 địa chỉ/lead. Đây là hành vi dò tìm địa chỉ email: dễ bị chặn IP, vào blacklist; nhiều nhà cung cấp cloud lại chặn sẵn cổng 25 outbound (khi đó luôn "không verify được" → confidence 20 → bị `min_confidence=30` loại hết) | Chỉ bật `pattern` khi thật cần; cân nhắc bỏ bước SMTP, chỉ giữ MX check |
+| **Email confidence 20% vẫn ghi vào Sheet** | `/find-email` (v1) không có ngưỡng → ghi cả địa chỉ đoán mò, lại không ghi cột `Email_Source`. Sales nhìn `Email_Found` dễ tưởng đã xác minh | Dùng v2; hoặc thêm ngưỡng cho v1; luôn đọc kèm `Email_Confidence` |
+| **`/score-leads` ghi Sheet mỗi lead một lần** | Google Sheets giới hạn khoảng 60 request ghi/phút/user → chấm quá ~60 lead trong một lượt là dính `429 Quota exceeded` giữa chừng, lead phía sau mất điểm | Gom `update_cells` theo lô 20-50 dòng; thêm retry backoff |
+| **`/crm/sync` không có cột đánh dấu** | Chạy lại là đẩy lại toàn bộ dòng; với HubSpot, contact **không có email** không tra được nên **tạo mới mỗi lần** → nhân bản contact | Thêm cột `CRM_Synced`; bỏ qua dòng thiếu email |
+| **Ba dịch vụ email tính tiền theo lượt tra** | `/find-email/v2` chạy cho **mọi dòng**, không lọc Tier → đốt credit Hunter/Apollo/Snov cho cả lead rác | Lọc HOT/WARM (hoặc `ICP_Tier` A/B) trước khi gọi |
 | **Cookie LinkedIn trong body request** | `POST /linkedin-sheet` nhận `li_at` qua HTTP; nếu không có TLS thì lộ toàn quyền tài khoản | Bắt buộc HTTPS; cân nhắc chỉ dùng chế độ extension |
 | **Cookie đi qua env var của subprocess** | `LINKEDIN_COOKIES_JSON` hiện trong environment của tiến trình con → có thể lộ qua `ps`/dump | Truyền qua stdin hoặc file tạm quyền 600 |
 | **`update_sheet_with_extra_cols` clear cả tab** | Nếu người khác đang sửa sheet cùng lúc, dữ liệu của họ bị xoá | Chuyển `from_sheet.py` sang `append_col_to_sheet` |
@@ -1181,14 +1607,27 @@ Công cụ kiểm thử thủ công: `test_extract_posts.py <file.html>` — ch�
 3. Đặt `headless=True`, bỏ `slow_mo` trong `from_sheet_linkedin.py`; đưa ra flag `--headful` cho debug — sửa B3.
 4. Thống nhất tên cột `Đã Crawl` / `Đã Enrich` giữa code, README và sheet thật — sửa B5.
 
+**Ưu tiên 1b — lỗi mới từ `7087e4b` / `c932e84`**
+4b. Sửa Notion query khi lead thiếu email: bỏ hẳn bước tìm trùng, luôn tạo page mới — sửa B7 (nguy cơ mất dữ liệu).
+4c. Thay `lstrip("www.")` bằng `re.sub(r"^www\.", "", domain)` ở cả hai module email — sửa B8.
+4d. Cho `_split_name()` một tham số quy ước tên (`western` / `vietnamese`), mặc định `western` vì ICP là SG/HK — sửa B9.
+4e. Validate `status` theo `VALID_STATUSES` trong `/lead-status/update`, trả 400 nếu sai — sửa B10.
+4f. Cho phép chạy chỉ với JWKS (bỏ rào 500 khi đã có `SUPABASE_URL`) — sửa B11.
+
 **Ưu tiên 2 — nhất quán & tin cậy**
 5. Đồng bộ `CHANGELOG_LINKEDIN_CRAWL.md` với hiện trạng, hoặc triển khai nốt format `posts[]` (kèm cờ tương thích ngược).
 6. Gom mọi tên cột sheet vào một module hằng số duy nhất (`src/sheet_columns.py`) thay vì rải rác từng script.
 7. Bọc `tenacity` retry (exponential backoff) cho mọi lời gọi DeepSeek; chỉ tick "đã xong" khi thực sự có dữ liệu.
 8. Thêm test cho `score_rule` (bảng barem rất dễ viết test) và `linkedin_post_extractor` (dùng fixture HTML đã lưu).
+8b. **Gộp `src/email_finder.py` vào `src/providers/email_providers.py`** rồi gỡ endpoint `/find-email` v1 (hoặc để nó proxy sang v2) — hiện hai bản logic trùng nhau, B8 và B9 tồn tại ở cả hai file nên sửa phải sửa hai chỗ.
+8c. Chốt **một** hệ chấm ICP (xem 10.6): hoặc dùng AI làm lớp giải thích cho barem rule-based, hoặc bỏ hẳn một trong hai. Để song song hai bộ cột `Tier` là nguồn nhầm lẫn thường trực cho sales.
+8d. Ghi `score_breakdown` của `ICPScorer` xuống Sheet (hoặc ít nhất log ra SSE) để điểm AI kiểm chứng được.
+8e. Đưa `icp_config` ra API — hiện `DEFAULT_ICP_CONFIG` hardcode trong `icp_scorer.py` trong khi cả tầng provider đã cấu hình được theo request.
+8f. Bổ sung `anthropic` + `google-generativeai` vào `requirements.txt`, hoặc cho `/providers/test` báo rõ "thiếu thư viện" thay vì lỗi import chung chung.
+8g. Cập nhật `.env.example` cho đủ các biến mới và đồng bộ `docs/prompt_post_comment.md` với prompt hiện tại.
 
 **Ưu tiên 3 — mở rộng**
-9. Thêm auth cho `server.py` (API key header) và siết `allow_origins`.
+9. ~~Thêm auth cho `server.py`~~ **(đã làm ở `7087e4b` bằng Supabase JWT)** — còn lại: siết `allow_origins` và thêm keepalive cho 4 endpoint SSE viết tay (`/find-email`, `/find-email/v2`, `/score-leads`, `/crm/sync`).
 10. Xử lý song song có kiểm soát: `asyncio.Semaphore` hoặc thread pool giới hạn 3–5 hàng đồng thời; tái sử dụng một browser instance cho nhiều URL.
 11. Thêm SQLite làm cache/hàng đợi trung gian, Google Sheet chỉ là view xuất ra → có lịch sử, retry chọn lọc, thống kê chi phí.
 12. Ghi log có cấu trúc (JSON lines) thay vì `print`, để endpoint SSE có thể phát event có kiểu thay vì text thô.
@@ -1222,6 +1661,18 @@ Công cụ kiểm thử thủ công: `test_extract_posts.py <file.html>` — ch�
 | `Post_Comment` | `gen_post_comment.py` | text | Comment 30–60 từ |
 | `Comment_Generated` | như trên | checkbox | |
 | `Connect_Status`, `Message_Sent` | `/auto-write` (từ extension) | text | Trạng thái auto connect / gửi message |
+| `Email_Found` | `/find-email`, `/find-email/v2` | text | Email công việc tìm được |
+| `Email_Confidence` | như trên | số | 0–100. `20` = đoán theo pattern · `60` = SMTP nhận · `90+` = provider đã verify |
+| `Email_Source` | **chỉ** `/find-email/v2` | text | `hunter` / `apollo` / `snov` / `pattern+smtp` / `pattern` |
+| `ICP_Score` | `/score-leads` | số | 0–100 do AI chấm (khác `Score_Total` của barem rule-based) |
+| `ICP_Tier` | như trên | text | `A` ≥75 · `B` 50–74 · `C` 30–49 · `D` <30 |
+| `ICP_Priority` | như trên | text | `High` (A/B) / `Medium` (C) / `Low` (D) |
+| `ICP_Reason` | như trên | text | 1–2 câu điểm mạnh/yếu của lead |
+| `ICP_Approach` | như trên | text | Một câu gợi ý cách tiếp cận |
+| `Lead_Status` | `/lead-status/update` | text | `cold` · `contacted` · `replied` · `meeting` · `proposal` · `closed_won` · `closed_lost` · `nurturing` |
+| `Lead_Note` | như trên | text | Ghi chú tự do của sales |
+
+> Nhóm cột `Email_*` / `ICP_*` / `Lead_*` **không có checkbox đi kèm**: cơ chế bỏ qua duy nhất là "ô `ICP_Score` đã có giá trị"; `Email_*` và CRM sync không bỏ qua gì cả.
 
 ### 19.2. Lịch sử tiến hoá (theo git log)
 
@@ -1235,6 +1686,8 @@ Công cụ kiểm thử thủ công: `test_extract_posts.py <file.html>` — ch�
 | **6. Service hoá** | `a1a4d8b`, `a4b7231` | FastAPI server, LinkedIn crawler, gỡ dependency ML nặng |
 | **7. Chấm điểm & sinh nội dung** | `8c563b3` → `69daabf` | `score_rule.py`, connect message, auto-write, post comment, metadata post từ HTML |
 | **8. Ổn định vận hành** | `ea52f02` | SSE keepalive chống AWS ALB timeout |
+| **9. Mở rộng ngoài LinkedIn** | `7087e4b` (18/08/2026) | Supabase JWT cho toàn bộ API; `src/providers/` (5 AI + 4 email + 2 CRM); `email_finder`, `icp_scorer`; 8 endpoint mới (`/find-email*`, `/score-leads`, `/lead-status*`, `/providers/*`, `/crm/sync`) |
+| **10. Cấu hình theo request** | `c932e84` (20/08/2026) | `ProviderConfig` — extension gửi kèm thứ tự provider + API key, ghi đè `.env`; `PostCommentGenerator` ưu tiên OpenRouter; viết lại khối `HUMANIZATION` để comment bớt văn phong AI |
 
 ### 19.3. Kịch bản sử dụng mẫu (từ zero đến outbound)
 
@@ -1270,4 +1723,4 @@ python gen_post_comment.py    --spreadsheet-id <ID> --gid <GID>   # → Post_Com
 
 ---
 
-*Tài liệu này được sinh từ việc đọc toàn bộ mã nguồn tại commit `69daabf` (nhánh `master`). Mọi số hiệu dòng tham chiếu theo trạng thái repo tại thời điểm đó.*
+*Tài liệu này được sinh từ việc đọc toàn bộ mã nguồn, cập nhật lần gần nhất theo commit `c932e84` (20/08/2026). Mọi số hiệu dòng tham chiếu theo trạng thái repo tại thời điểm đó.*

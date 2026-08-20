@@ -49,12 +49,7 @@ def main():
     from src.sheets_writer import read_from_sheet, append_col_to_sheet, append_checkbox_col_to_sheet
     from src.post_comment_generator import PostCommentGenerator
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        print("ERROR: DEEPSEEK_API_KEY not set in .env")
-        sys.exit(1)
-
-    generator = PostCommentGenerator(api_key=api_key)
+    generator = PostCommentGenerator()
 
     tab_desc = f"gid={args.gid}" if args.gid is not None else f"sheet='{args.sheet_name}'"
     print(f"Reading [{tab_desc}] from {args.spreadsheet_id} ...")

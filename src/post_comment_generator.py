@@ -7,6 +7,7 @@ from openai import OpenAI
 
 DEEPSEEK_MODEL    = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 _SYSTEM = """\
 You are a senior Business Development Executive with 10+ years of experience, known for writing thoughtful, human LinkedIn comments that quietly build relationships — never salesy, never generic.
@@ -42,10 +43,20 @@ WRITING RULES
 - Optionally close with ONE short, specific, answerable question tied to that detail and calibrated to the author's role.
 - Vary sentence rhythm and opening structure across different leads — do not default to a fixed template like "X stood out to me, I wonder Y" every time.
 
-HUMANIZATION — the final comment must read like a real person typed it, not an AI
-- Introduce subtle natural imperfections: slightly uneven rhythm, one casual word swap, a phrase that feels off-the-cuff
-- Do NOT add filler words ("just", "really", "honestly", "actually") more than once
-- Still reads as thoughtful — just less polished, more spontaneous
+HUMANIZATION — apply all rules below before outputting
+Remove every AI writing pattern:
+- No em dashes (— or –), replace with comma or period
+- No "vibrant", "crucial", "pivotal", "highlight", "underscore", "delve", "tapestry", "landscape", "testament", "showcase", "foster", "enhance", "key" (adjective)
+- No rule-of-three lists ("X, Y, and Z")
+- No bold text, no emojis
+- No filler openers: "Great post", "Thanks for sharing", "This resonates", "Honestly?", "Here's the thing", "Let's be real"
+- No signposting: "Let me", "I want to", "I'd like to"
+- No sycophancy: "Absolutely", "Certainly", "Of course"
+- No fake-candid hooks or theatrical pauses before the point
+- Vary sentence length — mix short and long, not uniform mid-length
+- Use "is/are/has" instead of "serves as / stands as / boasts"
+- Write like a real person typed it fast: slightly uneven rhythm, one casual word, a phrase that feels off-the-cuff
+- One short sentence for emphasis is fine; never stack multiple short fragments for drama
 
 STRICT CONSTRAINTS — the comment must NOT:
 - Mention, hint at, or imply any company, product, or service (including the BDE's own employer)
@@ -85,13 +96,27 @@ def _get(row: dict, *keys: str) -> str:
 
 
 class PostCommentGenerator:
-    """Generate a LinkedIn engagement comment from a post's content using DeepSeek."""
+    """Generate a LinkedIn engagement comment from a post's content.
 
-    def __init__(self, api_key: str | None = None):
-        key = api_key or os.getenv("DEEPSEEK_API_KEY")
-        if not key:
-            raise ValueError("DEEPSEEK_API_KEY not set. Add it to your .env file.")
-        self._client = OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL)
+    Priority: OpenRouter (if OPENROUTER_API_KEY set) → DeepSeek fallback.
+    """
+
+    def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None):
+        # OpenRouter takes priority if key is available
+        or_key   = os.getenv("OPENROUTER_API_KEY", "")
+        or_model = os.getenv("OPENROUTER_MODEL", "poolside/laguna-s-2.1:free")
+
+        if or_key and not base_url:
+            self._model  = model or or_model
+            self._client = OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL)
+            print(f"[PostCommentGenerator] using OpenRouter model: {self._model}")
+        else:
+            key = api_key or os.getenv("DEEPSEEK_API_KEY")
+            if not key:
+                raise ValueError("No AI key found. Set OPENROUTER_API_KEY or DEEPSEEK_API_KEY in .env")
+            self._model  = model or DEEPSEEK_MODEL
+            self._client = OpenAI(api_key=key, base_url=base_url or DEEPSEEK_BASE_URL)
+            print(f"[PostCommentGenerator] using DeepSeek model: {self._model}")
 
     def generate(self, row: dict, post_col: str = "Bài Viết") -> str:
         """
@@ -115,7 +140,7 @@ class PostCommentGenerator:
 
         try:
             response = self._client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
+                model=self._model,
                 messages=[
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user",   "content": prompt},

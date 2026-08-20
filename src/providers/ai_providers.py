@@ -135,6 +135,37 @@ class ClaudeProvider(AIProvider):
             return AIResponse("", self.name, self.model, False, str(e))
 
 
+# ── OpenRouter ────────────────────────────────────────────────────────────────
+
+class OpenRouterProvider(AIProvider):
+    name  = "openrouter"
+    model = "deepseek/deepseek-chat"
+
+    def __init__(self, api_key: str = "", model: str = ""):
+        self._key  = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        self.model = model or "deepseek/deepseek-chat"
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._key)
+
+    def complete(self, prompt: str, temperature: float = 0.3, max_tokens: int = 1000) -> AIResponse:
+        if not self._key:
+            return AIResponse("", self.name, self.model, False, "OPENROUTER_API_KEY not set")
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self._key, base_url="https://openrouter.ai/api/v1")
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return AIResponse(resp.choices[0].message.content or "", self.name, self.model, True)
+        except Exception as e:
+            return AIResponse("", self.name, self.model, False, str(e))
+
+
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 class GeminiProvider(AIProvider):
@@ -190,10 +221,11 @@ class AIRouter:
         """
         order = config.get("providers", ["deepseek", "openai", "claude", "gemini"])
         registry: dict[str, AIProvider] = {
-            "deepseek": DeepSeekProvider(config.get("deepseek_api_key", "")),
-            "openai":   OpenAIProvider(config.get("openai_api_key", ""),   config.get("openai_model", "")),
-            "claude":   ClaudeProvider(config.get("claude_api_key", ""),   config.get("claude_model", "")),
-            "gemini":   GeminiProvider(config.get("gemini_api_key", ""),   config.get("gemini_model", "")),
+            "deepseek":    DeepSeekProvider(config.get("deepseek_api_key", "")),
+            "openai":      OpenAIProvider(config.get("openai_api_key", ""),      config.get("openai_model", "")),
+            "claude":      ClaudeProvider(config.get("claude_api_key", ""),      config.get("claude_model", "")),
+            "gemini":      GeminiProvider(config.get("gemini_api_key", ""),      config.get("gemini_model", "")),
+            "openrouter":  OpenRouterProvider(config.get("openrouter_api_key", ""), config.get("openrouter_model", "")),
         }
         providers = [registry[p] for p in order if p in registry]
         return cls(providers or [DeepSeekProvider()])

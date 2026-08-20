@@ -138,6 +138,31 @@ async def _crawl_url(url: str) -> dict:
 
 # ── Request schemas ───────────────────────────────────────────────────────────
 
+class ProviderConfig(BaseModel):
+    """Config block gửi kèm từ extension (override .env)."""
+    # Email
+    email_providers:    list[str] = ["hunter", "apollo", "snov", "pattern"]
+    hunter_api_key:     str = ""
+    apollo_api_key:     str = ""
+    snov_client_id:     str = ""
+    snov_client_secret: str = ""
+    # AI
+    ai_providers:       list[str] = ["deepseek", "openai", "claude", "gemini"]
+    deepseek_api_key:   str = ""
+    openai_api_key:     str = ""
+    claude_api_key:     str = ""
+    gemini_api_key:     str = ""
+    openrouter_api_key: str = ""
+    openai_model:       str = ""
+    claude_model:       str = ""
+    openrouter_model:   str = ""  # e.g. "deepseek/deepseek-chat", "openai/gpt-4o", "anthropic/claude-opus-4"
+    # CRM
+    crm_providers:       list[str] = []
+    hubspot_api_key:     str = ""
+    notion_token:        str = ""
+    notion_database_id:  str = ""
+
+
 class CrawlRequest(BaseModel):
     url: str
 
@@ -277,14 +302,16 @@ class GenPostCommentRequest(BaseModel):
     post_col: str = "Bài Viết"
     limit: int | None = None
     regen: bool = False
+    provider_config: ProviderConfig = ProviderConfig()
 
 
 @app.post("/gen-post-comment")
 async def gen_post_comment(req: GenPostCommentRequest, _user: dict = Depends(require_auth)):
     """
-    Đọc cột "Bài Viết" từ Google Sheet → DeepSeek sinh comment để thả dưới bài viết
+    Đọc cột "Bài Viết" từ Google Sheet → AI sinh comment để thả dưới bài viết
     → ghi cột Post_Comment.
-    Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20 }
+    Body:     { "spreadsheet_id": "...", "gid": 123, "limit": 20,
+                "provider_config": { "openrouter_api_key": "...", "openrouter_model": "google/gemma-4-31b-it:free" } }
     Response: text/event-stream — stream stdout, dòng cuối __EXIT__:<code>
     """
     script = os.path.join(_HERE, "gen_post_comment.py")
@@ -294,7 +321,12 @@ async def gen_post_comment(req: GenPostCommentRequest, _user: dict = Depends(req
     if req.post_col:        cmd += ["--post-col", req.post_col]
     if req.limit:           cmd += ["--limit", str(req.limit)]
     if req.regen:           cmd += ["--regen"]
-    return _make_streaming_response(cmd, "gen-post-comment")
+    extra_env = {}
+    cfg = req.provider_config
+    if cfg.openrouter_api_key:
+        extra_env["OPENROUTER_API_KEY"]  = cfg.openrouter_api_key
+        extra_env["OPENROUTER_MODEL"]    = cfg.openrouter_model or "poolside/laguna-s-2.1:free"
+    return _make_streaming_response(cmd, "gen-post-comment", extra_env=extra_env)
 
 
 def _make_streaming_response(cmd: list, tag: str, extra_env: dict | None = None):
@@ -939,28 +971,6 @@ async def update_lead_statuses(req: LeadStatusUpdateRequest, _user: dict = Depen
 # MULTI-PROVIDER ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ProviderConfig(BaseModel):
-    """Config block gửi kèm từ extension (override .env)."""
-    # Email
-    email_providers:    list[str] = ["hunter", "apollo", "snov", "pattern"]
-    hunter_api_key:     str = ""
-    apollo_api_key:     str = ""
-    snov_client_id:     str = ""
-    snov_client_secret: str = ""
-    # AI
-    ai_providers:      list[str] = ["deepseek", "openai", "claude", "gemini"]
-    deepseek_api_key:  str = ""
-    openai_api_key:    str = ""
-    claude_api_key:    str = ""
-    gemini_api_key:    str = ""
-    openai_model:      str = ""
-    claude_model:      str = ""
-    # CRM
-    crm_providers:       list[str] = []
-    hubspot_api_key:     str = ""
-    notion_token:        str = ""
-    notion_database_id:  str = ""
-
 
 def _build_email_enricher(cfg: ProviderConfig):
     from src.providers.email_providers import EmailEnricher
@@ -976,13 +986,15 @@ def _build_email_enricher(cfg: ProviderConfig):
 def _build_ai_router(cfg: ProviderConfig):
     from src.providers.ai_providers import AIRouter
     return AIRouter.from_config({
-        "providers":       cfg.ai_providers,
-        "deepseek_api_key":cfg.deepseek_api_key,
-        "openai_api_key":  cfg.openai_api_key,
-        "claude_api_key":  cfg.claude_api_key,
-        "gemini_api_key":  cfg.gemini_api_key,
-        "openai_model":    cfg.openai_model,
-        "claude_model":    cfg.claude_model,
+        "providers":          cfg.ai_providers,
+        "deepseek_api_key":   cfg.deepseek_api_key,
+        "openai_api_key":     cfg.openai_api_key,
+        "claude_api_key":     cfg.claude_api_key,
+        "gemini_api_key":     cfg.gemini_api_key,
+        "openrouter_api_key": cfg.openrouter_api_key,
+        "openai_model":       cfg.openai_model,
+        "claude_model":       cfg.claude_model,
+        "openrouter_model":   cfg.openrouter_model,
     })
 
 
@@ -1049,6 +1061,9 @@ async def test_provider(req: TestProviderRequest, _user: dict = Depends(require_
         if p == "gemini":
             from src.providers.ai_providers import GeminiProvider
             return GeminiProvider(cfg.gemini_api_key).test_connection()
+        if p == "openrouter":
+            from src.providers.ai_providers import OpenRouterProvider
+            return OpenRouterProvider(cfg.openrouter_api_key, cfg.openrouter_model).test_connection()
         if p == "hubspot":
             from src.providers.crm_providers import HubSpotProvider
             return HubSpotProvider(cfg.hubspot_api_key).test_connection()
